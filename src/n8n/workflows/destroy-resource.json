@@ -1,0 +1,202 @@
+{
+  "name": "Destroy Resource (real handler — emits Telegram inline-keyboard approval prompt)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "destroy-resource",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Destroy Resource Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "destroy-resource"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 validation of the inbound webhook (R-02: fail-closed).\nconst crypto = require('crypto');\nconst secret = $env['DESTROY_RESOURCE_WEBHOOK_SECRET'] ?? '';\nif (!secret) throw new Error('DESTROY_RESOURCE_WEBHOOK_SECRET missing — fail-closed (R-02)');\nconst sig = $input.first().headers['x-signature-256'] ?? '';\nconst rawBody = $input.first().binary?.data?.data\n  ? Buffer.from($input.first().binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify($input.first().json);\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nif (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n  throw new Error('Invalid HMAC — dropping payload (R-02)');\n}\n\n// MVP supports railway-service only. Reject other types here so the operator gets a clear 4xx,\n// not a misleading approval prompt that would no-op on tap (ADR-0005).\nconst body = $input.first().json ?? {};\nconst resource_type = body.resource_type;\nconst resource_id = body.resource_id;\nif (resource_type !== 'railway-service') throw new Error('Unsupported resource_type — MVP only accepts \"railway-service\" (ADR-0005)');\nif (!resource_id || typeof resource_id !== 'string') throw new Error('Missing or non-string resource_id');\n// callback_data budget: 64 bytes total, prefix \"dr:a:rs:\" = 8 bytes → 56-byte ceiling on resource_id.\nif (resource_id.length > 48) throw new Error('resource_id exceeds 48-char callback_data budget');\nconst reason = typeof body.reason === 'string' ? body.reason : '';\nconst chat_id = body.chat_id ? String(body.chat_id) : '';\n\nreturn [{\n  json: {\n    intent: 'destroy delete remove drop terminate ' + resource_type + ' ' + resource_id,\n    chat_id,\n    user_id: String(body.user_id ?? ''),\n    timestamp: new Date().toISOString(),\n    metadata: { resource_type, resource_id, reason }\n  }\n}];"
+      },
+      "id": "validate-and-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 over the exact body string the Router will read (ADR-0003).\nconst crypto = require('crypto');\nconst p = $input.first().json;\nconst bodyObj = {\n  intent: p.intent,\n  chat_id: p.chat_id,\n  user_id: p.user_id,\n  timestamp: p.timestamp,\n  metadata: p.metadata,\n};\nconst bodyStr = JSON.stringify(bodyObj);\nconst secret = $env['SKILLS_ROUTER_SECRET'] ?? '';\nif (!secret) throw new Error('SKILLS_ROUTER_SECRET missing — fail-closed (R-02)');\nconst sig = 'sha256=' + crypto.createHmac('sha256', secret).update(bodyStr).digest('hex');\nreturn [{ json: { _bodyStr: bodyStr, _sig: sig, _chat_id: p.chat_id, _meta: p.metadata } }];"
+      },
+      "id": "compute-hmac",
+      "name": "Compute Skills Router HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env['SKILLS_ROUTER_URL'] }}/webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-signature-256", "value": "={{ $json._sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json._bodyStr }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "call-skills-router",
+      "name": "Call Skills Router",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "right-skill",
+              "leftValue": "={{ $json.skill ?? '' }}",
+              "rightValue": "destroy-resource",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "is-pending",
+              "leftValue": "={{ $json.status ?? '' }}",
+              "rightValue": "pending_approval",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "routing-gate",
+      "name": "Routing Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the Telegram approval prompt. Operator taps either button; approval-callback.json (ADR-0005) parses\n// the callback_data and routes to the destroy API. callback_data budget is 64 bytes; prefix \"dr:a:rs:\" = 8 bytes.\nconst meta = $('Compute Skills Router HMAC').first().json._meta;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id || $env['TELEGRAM_CHAT_ID'] || '';\nconst id = meta.resource_id;\nconst reason = meta.reason || '(no reason given)';\nconst text = '🚨 Destroy resource?\\nType: ' + meta.resource_type + '\\nID: ' + id + '\\nReason: ' + reason + '\\n\\nTap a button to confirm.';\nconst approve_data = 'dr:a:rs:' + id;\nconst deny_data = 'dr:d:rs:' + id;\nconst reply_markup = { inline_keyboard: [[ { text: '✅ Approve', callback_data: approve_data }, { text: '❌ Deny', callback_data: deny_data } ]] };\nreturn [{ json: { chat_id, text, reply_markup } }];"
+      },
+      "id": "build-prompt",
+      "name": "Build Approval Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.text, reply_markup: $json.reply_markup }) }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "send-prompt",
+      "name": "Send Approval Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nlet reason;\nif (r?.matched === false) {\n  reason = 'no skill matched';\n} else if (r?.skill && r.skill !== 'destroy-resource') {\n  reason = 'router routed to a different skill: ' + r.skill;\n} else if (r?.status && r.status !== 'pending_approval') {\n  reason = 'router returned unexpected status: ' + r.status;\n} else {\n  reason = 'unexpected router response';\n}\nreturn [{ json: { chat_id, text: 'Destroy approval prompt not sent — ' + reason } }];"
+      },
+      "id": "format-deny",
+      "name": "Format Router Reject",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.chat_id }}" },
+            { "name": "text", "value": "={{ $json.text }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "reply-telegram-deny",
+      "name": "Reply Router Reject",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 400]
+    }
+  ],
+  "connections": {
+    "Destroy Resource Webhook": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[
+        { "node": "Respond 200 OK", "type": "main", "index": 0 },
+        { "node": "Compute Skills Router HMAC", "type": "main", "index": 0 }
+      ]]
+    },
+    "Compute Skills Router HMAC": {
+      "main": [[{ "node": "Call Skills Router", "type": "main", "index": 0 }]]
+    },
+    "Call Skills Router": {
+      "main": [[{ "node": "Routing Gate", "type": "main", "index": 0 }]]
+    },
+    "Routing Gate": {
+      "main": [
+        [{ "node": "Build Approval Prompt", "type": "main", "index": 0 }],
+        [{ "node": "Format Router Reject", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Approval Prompt": {
+      "main": [[{ "node": "Send Approval Prompt", "type": "main", "index": 0 }]]
+    },
+    "Format Router Reject": {
+      "main": [[{ "node": "Reply Router Reject", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Real handler. Pattern mirrors github-pr.json (PR #12) and create-adr.json (PR #11), with the success arm replaced by a Telegram inline-keyboard approval prompt (ADR-0005, Option B). Note the Routing Gate inverts the canonical condition: SUCCESS arm requires status='pending_approval' (the Router unconditionally returns this for requires_approval=true skills). Pairs with approval-callback.json which listens for callback_query updates and executes the destroy. callback_data format: 'dr:<verb>:<resource_type_short>:<resource_id>' where verb=a|d, resource_type_short=rs (railway-service, MVP). Required env vars: DESTROY_RESOURCE_WEBHOOK_SECRET, SKILLS_ROUTER_URL, SKILLS_ROUTER_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID. Inbound payload: { resource_type: 'railway-service' (required, MVP), resource_id: string (required, ≤48 chars), reason?: string, chat_id?, user_id? }."
+}

@@ -1,0 +1,118 @@
+{
+  "model": "claude-opus-4-7",
+  "mcpServers": {
+    "linear": {
+      "type": "remote",
+      "url": "https://mcp.linear.app/sse",
+      "note": "Official Linear MCP server. Requires LINEAR_API_KEY in environment. Human must approve connection on first use."
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(npm run build)",
+      "Bash(npm run build:check)",
+      "Bash(npm run test)",
+      "Bash(npm run dev)",
+      "Bash(npx jest*)",
+      "Bash(terraform fmt*)",
+      "Bash(terraform validate*)",
+      "Bash(terraform plan*)",
+      "Bash(railway status)",
+      "Bash(railway up)",
+      "Bash(./tools/validate.sh)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git push*)"
+    ],
+    "deny": [
+      "Bash(terraform apply*)",
+      "Bash(terraform destroy*)",
+      "Bash(railway down*)",
+      "Bash(curl*botfather*)",
+      "Bash(*--no-verify*)",
+      "mcp__github__delete_file",
+      "mcp__github__fork_repository"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/enforce-current-focus-fresh.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/write-session-state.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-compact.sh",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-compact.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-validate.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-tool-commit-gate.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "autonomyContract": {
+    "version": "1.0",
+    "buildAgent": "docs/autonomy/build-agent-autonomy.md",
+    "runtimeSystem": "docs/autonomy/runtime-system-autonomy.md",
+    "humanGates": "CLAUDE.md#human-gated-operations-hitl"
+  }
+}

@@ -1,0 +1,176 @@
+{
+  "name": "Health Check (Skills Router + OpenRouter probes)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "health-check",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Health Check Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "health-check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 validation of the inbound webhook (R-02: fail-closed).\nconst crypto = require('crypto');\nconst secret = $env['HEALTH_CHECK_WEBHOOK_SECRET'] ?? '';\nif (!secret) throw new Error('HEALTH_CHECK_WEBHOOK_SECRET missing — fail-closed (R-02)');\nconst sig = $input.first().headers['x-signature-256'] ?? '';\nconst rawBody = $input.first().binary?.data?.data\n  ? Buffer.from($input.first().binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify($input.first().json);\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nif (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n  throw new Error('Invalid HMAC — dropping payload (R-02)');\n}\n\nconst body = $input.first().json ?? {};\nconst chat_id = body.chat_id ? String(body.chat_id) : '';\n\nreturn [{\n  json: {\n    intent: 'health status check',\n    chat_id,\n    user_id: String(body.user_id ?? ''),\n    timestamp: new Date().toISOString(),\n    metadata: {}\n  }\n}];"
+      },
+      "id": "validate-and-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 over the exact body string the Router will read (ADR-0003).\nconst crypto = require('crypto');\nconst p = $input.first().json;\nconst bodyObj = {\n  intent: p.intent,\n  chat_id: p.chat_id,\n  user_id: p.user_id,\n  timestamp: p.timestamp,\n  metadata: p.metadata,\n};\nconst bodyStr = JSON.stringify(bodyObj);\nconst secret = $env['SKILLS_ROUTER_SECRET'] ?? '';\nif (!secret) throw new Error('SKILLS_ROUTER_SECRET missing — fail-closed (R-02)');\nconst sig = 'sha256=' + crypto.createHmac('sha256', secret).update(bodyStr).digest('hex');\nreturn [{ json: { _bodyStr: bodyStr, _sig: sig, _chat_id: p.chat_id } }];"
+      },
+      "id": "compute-hmac",
+      "name": "Compute Skills Router HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env['SKILLS_ROUTER_URL'] }}/webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-signature-256", "value": "={{ $json._sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json._bodyStr }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "call-skills-router",
+      "name": "Call Skills Router",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env['SKILLS_ROUTER_URL'] }}/health",
+        "options": { "timeout": 5000 }
+      },
+      "id": "probe-router-health",
+      "name": "Probe Router /health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 220],
+      "continueOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://openrouter.ai/api/v1/credits",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env['OPENROUTER_MANAGEMENT_KEY'] }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "probe-openrouter-credits",
+      "name": "Probe OpenRouter /credits",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 380],
+      "continueOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Combine the two parallel probes into a single Telegram-friendly status line.\n// Reuses the same response-shape parsing as OpenRouterBudgetGate.getCreditsBalance\n// (src/agent/index.ts:254-257): remaining = total_credits - total_usage.\nconst routerProbe = $('Probe Router /health').first();\nconst creditsProbe = $('Probe OpenRouter /credits').first();\n\nfunction routerOk() {\n  if (routerProbe?.json?.error) return false;\n  return routerProbe?.json?.status === 'ok';\n}\n\nfunction creditsRemaining() {\n  const data = creditsProbe?.json?.data;\n  if (!data) return null;\n  const totalCredits = Number(data.total_credits ?? 0);\n  const totalUsage = Number(data.total_usage ?? 0);\n  return totalCredits - totalUsage;\n}\n\nconst router = routerOk() ? 'ok' : 'DOWN';\nconst remaining = creditsRemaining();\nconst openrouter = remaining === null ? 'DOWN' : `$${remaining.toFixed(2)}`;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nconst timestamp = new Date().toISOString();\n\nreturn [{\n  json: {\n    chat_id,\n    text: `Health: router=${router} openrouter=${openrouter} ts=${timestamp}`,\n    router,\n    openrouter,\n    remaining_usd: remaining,\n    timestamp\n  }\n}];"
+      },
+      "id": "format-health",
+      "name": "Format health summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.chat_id }}" },
+            { "name": "text", "value": "={{ $json.text }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "reply-telegram",
+      "name": "Reply to Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 300]
+    }
+  ],
+  "connections": {
+    "Health Check Webhook": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[
+        { "node": "Respond 200 OK", "type": "main", "index": 0 },
+        { "node": "Compute Skills Router HMAC", "type": "main", "index": 0 }
+      ]]
+    },
+    "Compute Skills Router HMAC": {
+      "main": [[{ "node": "Call Skills Router", "type": "main", "index": 0 }]]
+    },
+    "Call Skills Router": {
+      "main": [[
+        { "node": "Probe Router /health", "type": "main", "index": 0 },
+        { "node": "Probe OpenRouter /credits", "type": "main", "index": 0 }
+      ]]
+    },
+    "Probe Router /health": {
+      "main": [[{ "node": "Format health summary", "type": "main", "index": 0 }]]
+    },
+    "Probe OpenRouter /credits": {
+      "main": [[{ "node": "Format health summary", "type": "main", "index": 0 }]]
+    },
+    "Format health summary": {
+      "main": [[{ "node": "Reply to Telegram", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Reference implementation for migrating other stub workflows. Pattern: webhook → HMAC validate (R-02 fail-closed) → respond 200 in parallel → ADR-0003 sign → call Skills Router → two parallel external probes (continueOnFail so a single down service returns 'DOWN' rather than crashing) → format → Telegram reply. Required env vars: HEALTH_CHECK_WEBHOOK_SECRET, SKILLS_ROUTER_URL, SKILLS_ROUTER_SECRET, OPENROUTER_MANAGEMENT_KEY, TELEGRAM_BOT_TOKEN. The /credits parsing (data.total_credits - data.total_usage) intentionally mirrors OpenRouterBudgetGate.getCreditsBalance in src/agent/index.ts:254-257 so a single response-shape change is caught in two places."
+}

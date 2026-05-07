@@ -1,0 +1,191 @@
+{
+  "name": "OpenRouter Infer (budget-gated)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "openrouter-infer",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "OpenRouter Infer Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "openrouter-infer"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 validation of the inbound webhook (R-02: fail-closed).\nconst crypto = require('crypto');\nconst secret = $env['OPENROUTER_INFER_WEBHOOK_SECRET'] ?? '';\nif (!secret) throw new Error('OPENROUTER_INFER_WEBHOOK_SECRET missing — fail-closed (R-02)');\nconst sig = $input.first().headers['x-signature-256'] ?? '';\nconst rawBody = $input.first().binary?.data?.data\n  ? Buffer.from($input.first().binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify($input.first().json);\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nif (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n  throw new Error('Invalid HMAC — dropping payload (R-02)');\n}\n\nconst body = $input.first().json ?? {};\nconst prompt = body.prompt;\nconst chat_id = body.chat_id ? String(body.chat_id) : '';\nconst model = body.model ?? 'openrouter/auto';\nif (!prompt) throw new Error('Missing prompt');\n\nreturn [{\n  json: {\n    intent: 'infer prompt llm ' + prompt,\n    chat_id,\n    user_id: String(body.user_id ?? ''),\n    timestamp: new Date().toISOString(),\n    metadata: { prompt, model }\n  }\n}];"
+      },
+      "id": "validate-and-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 over the exact body string the Router will read (ADR-0003).\nconst crypto = require('crypto');\nconst p = $input.first().json;\nconst bodyObj = {\n  intent: p.intent,\n  chat_id: p.chat_id,\n  user_id: p.user_id,\n  timestamp: p.timestamp,\n  metadata: p.metadata,\n};\nconst bodyStr = JSON.stringify(bodyObj);\nconst secret = $env['SKILLS_ROUTER_SECRET'] ?? '';\nif (!secret) throw new Error('SKILLS_ROUTER_SECRET missing — fail-closed (R-02)');\nconst sig = 'sha256=' + crypto.createHmac('sha256', secret).update(bodyStr).digest('hex');\nreturn [{ json: { _bodyStr: bodyStr, _sig: sig, _meta: p.metadata, _chat_id: p.chat_id } }];"
+      },
+      "id": "compute-hmac",
+      "name": "Compute Skills Router HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env['SKILLS_ROUTER_URL'] }}/webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-signature-256", "value": "={{ $json._sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json._bodyStr }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "call-skills-router",
+      "name": "Call Skills Router",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "is-pending",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "pending_approval",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "branch-on-budget",
+      "name": "Budget gated?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Authorization", "value": "=Bearer {{ $env['OPENROUTER_RUNTIME_KEY'] }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={ \"model\": \"{{ $('Compute Skills Router HMAC').item.json._meta.model }}\", \"messages\": [{ \"role\": \"user\", \"content\": \"{{ $('Compute Skills Router HMAC').item.json._meta.prompt }}\" }] }",
+        "options": { "timeout": 60000 }
+      },
+      "id": "call-openrouter",
+      "name": "Call OpenRouter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $('Compute Skills Router HMAC').item.json._chat_id }}" },
+            { "name": "text", "value": "={{ $json.choices?.[0]?.message?.content ?? 'OpenRouter call returned no content' }}" }
+          ]
+        }
+      },
+      "id": "reply-success",
+      "name": "Reply with completion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $('Compute Skills Router HMAC').item.json._chat_id }}" },
+            { "name": "text", "value": "=⚠ OpenRouter $10/day budget threshold reached. Approve to proceed: prompt=\"{{ $('Compute Skills Router HMAC').item.json._meta.prompt }}\" remaining=${{ $json.remaining }}" }
+          ]
+        }
+      },
+      "id": "reply-pending",
+      "name": "Notify HITL approval",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 400]
+    }
+  ],
+  "connections": {
+    "OpenRouter Infer Webhook": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[
+        { "node": "Respond 200 OK", "type": "main", "index": 0 },
+        { "node": "Compute Skills Router HMAC", "type": "main", "index": 0 }
+      ]]
+    },
+    "Compute Skills Router HMAC": {
+      "main": [[{ "node": "Call Skills Router", "type": "main", "index": 0 }]]
+    },
+    "Call Skills Router": {
+      "main": [[{ "node": "Budget gated?", "type": "main", "index": 0 }]]
+    },
+    "Budget gated?": {
+      "main": [
+        [{ "node": "Notify HITL approval", "type": "main", "index": 0 }],
+        [{ "node": "Call OpenRouter", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call OpenRouter": {
+      "main": [[{ "node": "Reply with completion", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Import via n8n UI: Workflows → Import from file. Set env vars OPENROUTER_INFER_WEBHOOK_SECRET, SKILLS_ROUTER_URL, SKILLS_ROUTER_SECRET, OPENROUTER_RUNTIME_KEY, TELEGRAM_BOT_TOKEN before activating. The runtime key is provisioned with a $10/day cap (limit_reset=daily) by tools/provision-openrouter-runtime-key.sh; OpenRouter rejects calls server-side once the cap is hit."
+}

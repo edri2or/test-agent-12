@@ -1,0 +1,178 @@
+name: Update Provisioner App permissions
+
+# One-shot workflow: adds organization_administration:write to the existing
+# Provisioner App (autonomous-agent-provisioner-v2) via PATCH /app using a
+# JWT signed with the app's own private key.
+#
+# After this workflow succeeds, GitHub will prompt the org owner to approve
+# the new permission on the app's installation page — that single click is
+# the required vendor floor (GitHub App permission changes require owner
+# approval per GitHub policy).
+#
+# Once the org owner approves, dispatch delete-phantom-org-ruleset.yml to
+# find and remove the Required Workflow ruleset that generates phantom runs.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # WIF token exchange
+
+jobs:
+  update-permissions:
+    name: Patch Provisioner App — add organization_administration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Patch app permissions via JWT-authenticated PATCH /app
+        env:
+          APP_ID:          ${{ steps.provisioner.outputs.provisioner-app-id }}
+          APP_PRIVATE_KEY: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+        run: |
+          set -euo pipefail
+
+          # ── Generate GitHub App JWT (valid 60 s) ─────────────────────────
+          # GitHub Apps authenticate to /app endpoints with a short-lived JWT
+          # signed with their private key (RS256, iat/exp claims).
+          python3 - <<'PYEOF'
+          import os, time, base64, json, hashlib, hmac, subprocess, sys, tempfile
+
+          app_id  = os.environ["APP_ID"].strip()
+          pem     = os.environ["APP_PRIVATE_KEY"].strip()
+
+          # Write PEM to temp file for openssl
+          with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+              f.write(pem)
+              pem_path = f.name
+
+          now = int(time.time())
+          header  = {"alg": "RS256", "typ": "JWT"}
+          payload = {"iat": now - 10, "exp": now + 60, "iss": app_id}
+
+          def b64url(data: bytes) -> str:
+              return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+          h = b64url(json.dumps(header, separators=(',',':')).encode())
+          p = b64url(json.dumps(payload, separators=(',',':')).encode())
+          msg = f"{h}.{p}"
+
+          # Sign with openssl dgst (available on ubuntu-latest runners)
+          result = subprocess.run(
+              ["openssl", "dgst", "-sha256", "-sign", pem_path],
+              input=msg.encode(), capture_output=True
+          )
+          if result.returncode != 0:
+              print(f"openssl error: {result.stderr.decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          sig = b64url(result.stdout)
+          jwt = f"{msg}.{sig}"
+
+          # Write JWT to GITHUB_ENV for next step
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"APP_JWT={jwt}\n")
+
+          print("✅ JWT generated successfully")
+          os.unlink(pem_path)
+          PYEOF
+
+      - name: Verify JWT with GET /app (diagnose auth before PATCH)
+        env:
+          APP_ID: ${{ steps.provisioner.outputs.provisioner-app-id }}
+        run: |
+          set -euo pipefail
+          echo "::notice::APP_ID_PREFIX=$(echo "$APP_ID" | cut -c1-8)"
+          GET_STATUS=$(curl -s -o /tmp/get_app.json -w "%{http_code}" \
+            -H "Authorization: Bearer $APP_JWT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/app)
+          GET_RESP=$(cat /tmp/get_app.json)
+          GET_SNIPPET=$(echo "$GET_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name', str(d)[:200]))" 2>/dev/null || echo "$GET_RESP" | head -c 200)
+          echo "::notice::GET /app status=$GET_STATUS name=$GET_SNIPPET"
+          if [ "$GET_STATUS" != "200" ]; then
+            echo "::error::JWT invalid — GET /app returned $GET_STATUS. JWT auth is broken; fix App ID or private key."
+            exit 1
+          fi
+
+      - name: Call PATCH /app to add organization_administration:write
+        run: |
+          set -euo pipefail
+
+          # All permissions in one flat default_permissions object.
+          # Org-level admin uses key "organization_administration" (not a nested field).
+          HTTP_STATUS=$(curl -s -o /tmp/patch_response.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Bearer $APP_JWT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/app \
+            -d '{
+              "default_permissions": {
+                "administration":              "write",
+                "contents":                    "write",
+                "secrets":                     "write",
+                "workflows":                   "write",
+                "actions":                     "write",
+                "metadata":                    "read",
+                "organization_administration": "write"
+              }
+            }')
+
+          RESPONSE=$(cat /tmp/patch_response.json)
+          echo "HTTP status: $HTTP_STATUS"
+          echo "Response: $RESPONSE"
+
+          # Write full response to step summary for diagnostics
+          {
+            echo "## PATCH /app response"
+            echo "HTTP status: \`$HTTP_STATUS\`"
+            echo '```json'
+            echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Emit annotation so the HTTP status is visible via the check-run API
+          echo "::notice::PATCH /app HTTP_STATUS=$HTTP_STATUS"
+          RESP_SNIPPET=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d)[:300])" 2>/dev/null || echo "$RESPONSE" | head -c 300)
+          echo "::notice::PATCH /app RESPONSE=$RESP_SNIPPET"
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "::error::PATCH /app failed HTTP $HTTP_STATUS — $RESP_SNIPPET"
+            echo "❌ PATCH /app failed with HTTP $HTTP_STATUS" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          RESPONSE="$RESPONSE"
+
+          APP_NAME=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('name','?'))")
+          echo "✅ App patched: $APP_NAME"
+          echo "$RESPONSE" | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          perms = d.get('permissions', {})
+          print('Current permissions after PATCH:')
+          for k,v in sorted(perms.items()):
+              print(f'  {k}: {v}')
+          " >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Next step" >> "$GITHUB_STEP_SUMMARY"
+          echo "GitHub will now prompt the org owner to approve the new \`organization_administration: write\` permission." >> "$GITHUB_STEP_SUMMARY"
+          echo "After approval, dispatch **delete-phantom-org-ruleset** to remove the phantom-causing ruleset." >> "$GITHUB_STEP_SUMMARY"

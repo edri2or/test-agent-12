@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-10
+  description: "Test agent 10 — clean first-attempt proof with all fixes (Issues 1–13); Issue 13 fix: poll Railway API via builder token instead of clone SM"
+spec:
+  gcp:
+    projectId: or-test-agent-10
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-10
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-10.or-infra.com
+    worker:
+      name: test-agent-10-edge
+      route: test-agent-10.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "clean first-attempt proof with all 13 friction fixes; Issue 13 fix polls Railway API via builder token (no clone SM dependency)"

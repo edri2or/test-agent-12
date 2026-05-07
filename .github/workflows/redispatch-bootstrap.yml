@@ -1,0 +1,164 @@
+name: Redispatch bootstrap in clone
+
+# Dispatch bootstrap-dispatch.yml in an existing clone repo using the Provisioner App token.
+# Useful for re-running bootstrap after a fix (e.g. correcting Railway env vars)
+# without re-provisioning the full clone.
+#
+# Uses GitHub's return_run_details API (2026-02-19) to capture run_id immediately,
+# then polls to completion — operator never needs to report status.
+
+on:
+  workflow_dispatch:
+    inputs:
+      clone_repo:
+        description: 'Clone repo (owner/repo, e.g. edri2or/test-agent-02)'
+        required: true
+      skip_terraform:
+        description: 'Skip terraform apply in the clone bootstrap'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      skip_railway:
+        description: 'Skip Railway variable injection in the clone bootstrap'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  redispatch:
+    name: Dispatch bootstrap-dispatch.yml in ${{ inputs.clone_repo }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Dispatch bootstrap-dispatch.yml and poll to completion
+        env:
+          GH_TOKEN:     ${{ steps.app-token.outputs.token }}
+          CLONE_REPO:   ${{ inputs.clone_repo }}
+          SKIP_TF:      ${{ inputs.skip_terraform }}
+          SKIP_RAILWAY: ${{ inputs.skip_railway }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import datetime, json, os, sys, time, urllib.request, urllib.error
+
+          token       = os.environ["GH_TOKEN"]
+          clone_repo  = os.environ["CLONE_REPO"]
+          skip_tf     = os.environ["SKIP_TF"]
+          skip_railway = os.environ["SKIP_RAILWAY"]
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+
+          HEADERS = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+          }
+          BASE = "https://api.github.com"
+
+          def gh(method, path, body=None):
+            req = urllib.request.Request(
+              f"{BASE}{path}", data=json.dumps(body).encode() if body else None,
+              headers=HEADERS, method=method
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+                return r.status, json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+              return e.code, json.loads(e.read().decode("utf-8", "replace"))
+
+          # Dispatch with return_run_details=true (GitHub API 2026-02-19).
+          # Returns 200 + {"id": <run_id>} instead of 204, eliminating the
+          # race condition of polling for the just-dispatched run by timestamp.
+          status, resp = gh("POST", f"/repos/{clone_repo}/actions/workflows/bootstrap-dispatch.yml/dispatches", {
+            "ref": "main",
+            "inputs": {"skip_terraform": skip_tf, "skip_railway": skip_railway},
+            "return_run_details": True,
+          })
+
+          run_id  = resp.get("id")
+          run_url = resp.get("workflow_url") or f"https://github.com/{clone_repo}/actions"
+
+          if status not in (200, 201, 204):
+            print(f"::error::dispatch HTTP {status}: {resp}")
+            sys.exit(1)
+          if not run_id:
+            # GitHub App installation tokens return 204 without a body; return_run_details
+            # only works with PATs. Fall back to polling by timestamp.
+            print(f"dispatch status={status}, no run_id — falling back to timestamp poll")
+            dispatch_ts = time.time()
+            for delay in [5, 10, 15, 20, 30, 40]:
+              time.sleep(delay)
+              _, runs = gh("GET", f"/repos/{clone_repo}/actions/workflows/bootstrap-dispatch.yml/runs?per_page=5&event=workflow_dispatch")
+              for r in (runs.get("workflow_runs") or []):
+                created = datetime.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).timestamp()
+                if created >= dispatch_ts - 5:
+                  run_id = r["id"]
+                  run_url = r["html_url"]
+                  break
+              if run_id:
+                break
+
+          if not run_id:
+            print("::error::Could not determine run_id — check Actions tab manually")
+            sys.exit(1)
+
+          print(f"::notice::bootstrap-dispatch.yml dispatched on {clone_repo} — run {run_id}: {run_url}")
+
+          # Poll to completion (max 20 min)
+          deadline = time.time() + 1200
+          conclusion = None
+          while time.time() < deadline:
+            _, run = gh("GET", f"/repos/{clone_repo}/actions/runs/{run_id}")
+            run_status = run.get("status")
+            conclusion = run.get("conclusion")
+            run_url = run.get("html_url", run_url)
+            print(f"  status={run_status} conclusion={conclusion}")
+            if run_status == "completed":
+              break
+            time.sleep(15)
+          else:
+            print("::warning::Timed out waiting for bootstrap-dispatch.yml to complete (20 min)")
+            conclusion = "timed_out"
+
+          icon = "✅" if conclusion == "success" else "❌"
+          with open(summary_path, "a") as f:
+            f.write(f"## {icon} bootstrap-dispatch.yml on `{clone_repo}`\n\n")
+            f.write(f"- skip_terraform: `{skip_tf}`\n")
+            f.write(f"- skip_railway: `{skip_railway}`\n")
+            f.write(f"- conclusion: **{conclusion}**\n")
+            f.write(f"- Run: {run_url}\n")
+
+          if conclusion != "success":
+            print(f"::error::bootstrap-dispatch.yml concluded: {conclusion} — {run_url}")
+            sys.exit(1)
+
+          print(f"::notice::bootstrap-dispatch.yml completed: {conclusion}")
+          PYEOF

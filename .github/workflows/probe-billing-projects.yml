@@ -1,0 +1,90 @@
+name: Probe billing-account projects
+
+# Lists all projects linked to GCP_BILLING_ACCOUNT and surfaces the
+# count + per-project lifecycle state to the workflow summary +
+# annotations. Read-only. Used to diagnose "Cloud billing quota
+# exceeded" errors from grant-autonomy.sh's billing-link step
+# (observed in apply-system-spec runs 25253910937, 25254068938,
+# 25254227982 — all three blocked at the 5-project billing-account
+# soft-cap).
+
+on:
+  workflow_dispatch:
+    inputs:
+      billing_account_id:
+        description: 'GCP billing account ID to probe'
+        required: true
+        default: '014D0F-AC8E0F-5A7EE7'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  probe:
+    name: Probe billing-account project list
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: List linked projects
+        env:
+          BA: ${{ inputs.billing_account_id }}
+        run: |
+          # No `set -e` — we want to capture failures and surface as annotations.
+          ANNOTATE_ERR() {
+            local title="$1"; local body="$2"
+            local enc
+            enc=$(printf '%s' "$body" | tr '\n' '|' | head -c 1500)
+            printf '::error title=%s::%s\n' "$title" "$enc"
+          }
+
+          echo "=== gcloud billing accounts list (sanity check) ==="
+          if ! BA_OUT=$(gcloud billing accounts list 2>&1); then
+            ANNOTATE_ERR "billing-accounts-list-FAIL" "$BA_OUT"
+            echo "$BA_OUT"
+          else
+            echo "$BA_OUT"
+          fi
+
+          echo ""
+          echo "=== gcloud billing projects list --billing-account=$BA ==="
+          if ! OUT=$(gcloud billing projects list --billing-account="$BA" \
+              --format='value(projectId,billingEnabled)' 2>&1); then
+            ANNOTATE_ERR "billing-projects-list-FAIL" "$OUT"
+            echo "$OUT"
+            echo "## ❌ Billing projects list failed" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$OUT" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "$OUT"
+
+          {
+            echo "## Projects linked to \`billingAccounts/$BA\`"
+            echo ""
+            echo "| Project ID | Billing enabled | Lifecycle state |"
+            echo "|------------|-----------------|-----------------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          COUNT=0
+          while IFS=$'\t' read -r pid enabled; do
+            [ -z "$pid" ] && continue
+            COUNT=$((COUNT + 1))
+            STATE=$(gcloud projects describe "$pid" --format='value(lifecycleState)' 2>/dev/null || echo "DESCRIBE_FAIL")
+            echo "| \`$pid\` | $enabled | $STATE |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=billing-linked::$pid enabled=$enabled state=$STATE"
+          done <<< "$OUT"
+          {
+            echo ""
+            echo "**Total linked: $COUNT**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=billing-quota-summary::$COUNT projects linked to billing $BA"

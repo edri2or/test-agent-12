@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aatb.or-infra.com/schemas/system-spec.v1.json",
+  "title": "SystemSpec",
+  "description": "Specification for an agent system provisioned by autonomous-agent-template-builder. Consumed by apply-system-spec.yml.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "aatb.or-infra.com/v1"
+    },
+    "kind": {
+      "const": "SystemSpec"
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,61}[a-z0-9]$",
+          "description": "Kebab-case system identifier, 3–63 chars. Used as a key in resource names."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "required": ["gcp", "github"],
+      "additionalProperties": false,
+      "properties": {
+        "gcp": {
+          "type": "object",
+          "required": ["projectId"],
+          "additionalProperties": false,
+          "properties": {
+            "projectId": {
+              "type": "string",
+              "pattern": "^or-[a-z][a-z0-9-]{1,25}[a-z0-9]$",
+              "description": "GCP project ID: 6–30 chars, must start with 'or-', lowercase letters/digits/hyphens only."
+            },
+            "region": {
+              "type": "string",
+              "default": "us-central1",
+              "description": "GCP region for Cloud Run and Secret Manager. Defaults to us-central1."
+            }
+          }
+        },
+        "github": {
+          "type": "object",
+          "required": ["repo"],
+          "additionalProperties": false,
+          "properties": {
+            "repo": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+              "description": "Target repository in owner/repo format. Created from fromTemplate if it does not exist."
+            },
+            "fromTemplate": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+              "description": "Template repository in owner/repo format. Defaults to edri2or/autonomous-agent-template-builder."
+            }
+          }
+        },
+        "railway": {
+          "type": "object",
+          "required": ["services"],
+          "additionalProperties": false,
+          "properties": {
+            "services": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 5,
+              "description": "Railway services to provision. Maximum 5 per spec (OPA policy ceiling).",
+              "items": {
+                "type": "object",
+                "required": ["name", "kind"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9-]*$",
+                    "description": "Service name, lowercase kebab-case."
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": ["typescript", "docker"],
+                    "description": "Service type: typescript (built from source) or docker (pre-built image)."
+                  },
+                  "rootDir": {
+                    "type": "string",
+                    "description": "Source root relative to repo root. Required when kind=typescript."
+                  },
+                  "image": {
+                    "type": "string",
+                    "description": "Docker image reference. Required when kind=docker."
+                  }
+                },
+                "if": {
+                  "properties": { "kind": { "const": "typescript" } }
+                },
+                "then": {
+                  "required": ["rootDir"]
+                },
+                "else": {
+                  "required": ["image"]
+                }
+              }
+            }
+          }
+        },
+        "cloudflare": {
+          "type": "object",
+          "required": ["zone"],
+          "additionalProperties": false,
+          "properties": {
+            "zone": {
+              "type": "string",
+              "description": "Cloudflare zone (domain). Must exist in the operator's Cloudflare account."
+            },
+            "worker": {
+              "type": "object",
+              "required": ["name", "route"],
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]*$",
+                  "description": "Cloudflare Worker script name."
+                },
+                "route": {
+                  "type": "string",
+                  "description": "Cloudflare route pattern, e.g. example.com/*"
+                }
+              }
+            }
+          }
+        },
+        "secrets": {
+          "type": "object",
+          "required": ["required"],
+          "additionalProperties": false,
+          "properties": {
+            "required": {
+              "type": "array",
+              "minItems": 1,
+              "description": "GCP Secret Manager keys required at runtime. Must follow kebab-case convention (ADR-0006). Bootstrap verifies all are present before deploy.",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*$",
+                "description": "Kebab-case secret name matching ADR-0006 canon."
+              }
+            }
+          }
+        },
+        "intent": {
+          "type": "object",
+          "required": ["source"],
+          "additionalProperties": false,
+          "description": "Audit trail: the natural-language request that produced this spec. Not used by the provisioner.",
+          "properties": {
+            "source": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "description": "Original natural-language build request."
+            }
+          }
+        }
+      }
+    }
+  }
+}

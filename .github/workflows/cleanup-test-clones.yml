@@ -1,0 +1,78 @@
+name: Cleanup test clones (autonomous)
+
+# Purpose: delete partial-state GCP projects created during Phase E
+# CI-WIF iteration. Frees billing-account project quota and removes
+# litter. The runtime SA has roles/owner on each clone (created itself
+# via grant-autonomy.sh), so deletion is permitted.
+#
+# Hard-coded to test-clone IDs only (defensive): refuses to delete
+# anything that doesn't match the `or-test-clone-NNN` pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_ids:
+        description: 'Comma-separated list of project IDs to delete (must match or-test-clone-NNN pattern)'
+        required: true
+        default: 'or-test-clone-002,or-test-clone-003,or-test-clone-004,or-test-clone-005,or-test-clone-006,or-test-clone-007,or-test-clone-008'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cleanup:
+    name: Cleanup test clones
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Validate input pattern
+        run: |
+          IFS=',' read -ra PIDS <<< "${{ inputs.project_ids }}"
+          for pid in "${PIDS[@]}"; do
+            pid_trim=$(echo "$pid" | tr -d ' ')
+            if ! [[ "$pid_trim" =~ ^or-test-clone-[0-9]{3}$ ]]; then
+              echo "::error::REFUSED: project_id '${pid_trim}' does not match or-test-clone-NNN pattern (defensive guard)"
+              exit 1
+            fi
+          done
+          echo "::notice::PATTERN_OK: all inputs match or-test-clone-NNN"
+
+      - name: Delete projects (idempotent)
+        run: |
+          IFS=',' read -ra PIDS <<< "${{ inputs.project_ids }}"
+          for pid in "${PIDS[@]}"; do
+            pid_trim=$(echo "$pid" | tr -d ' ')
+            if gcloud projects describe "$pid_trim" >/dev/null 2>&1; then
+              echo "::notice::DELETING: $pid_trim"
+              if OUT=$(gcloud projects delete "$pid_trim" --quiet 2>&1); then
+                echo "::notice::DELETED: $pid_trim"
+              else
+                ENC=$(printf '%s' "$OUT" | tr '\n' '|' | head -c 600)
+                echo "::error::DELETE_FAIL: $pid_trim — $ENC"
+              fi
+            else
+              echo "::notice::SKIP_NOT_FOUND: $pid_trim"
+            fi
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Cleanup complete"
+            echo
+            echo "Inputs: \`${{ inputs.project_ids }}\`"
+            echo
+            echo "Verify via probe-clone-state.yml on each ID; expect PROJECT_MISSING_OR_DENIED."
+          } >> "$GITHUB_STEP_SUMMARY"

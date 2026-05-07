@@ -1,0 +1,60 @@
+name: Read Railway agent service domain
+
+on:
+  workflow_dispatch:
+    inputs:
+      clone_project_id:
+        description: GCP project ID of the clone
+        required: true
+        default: or-test-agent-05
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  read-domain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Read secrets and query Railway
+        env:
+          CLONE_PROJECT: ${{ inputs.clone_project_id }}
+        run: |
+          TOKEN=$(gcloud secrets versions access latest \
+            --secret=railway-api-token --project="$CLONE_PROJECT")
+          N8N=$(gcloud secrets versions access latest \
+            --secret=railway-n8n-service-id --project="$CLONE_PROJECT" 2>/dev/null || true)
+          AGT=$(gcloud secrets versions access latest \
+            --secret=railway-agent-service-id --project="$CLONE_PROJECT" 2>/dev/null || true)
+          echo "::notice::n8n_service_id=${N8N}"
+          echo "::notice::agent_service_id=${AGT}"
+          for SVC_ID in "${N8N}" "${AGT}"; do
+            [ -z "${SVC_ID}" ] && continue
+            printf '{"query":"{service(id:\"%s\"){serviceInstances{edges{node{domains{serviceDomains{domain}}}}}}}"}' \
+              "${SVC_ID}" > /tmp/gql.json
+            RESP=$(curl -sf -X POST https://backboard.railway.app/graphql/v2 \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "User-Agent: autonomous-agent/1.0" \
+              --data @/tmp/gql.json 2>/dev/null || echo '{}')
+            DOMAIN=$(echo "${RESP}" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          edges=((d.get('data') or {}).get('service') or {}).get('serviceInstances',{}).get('edges',[])
+          for e in edges:
+            sds=(e.get('node') or {}).get('domains',{}).get('serviceDomains',[])
+            if sds:
+              print(sds[0]['domain']); sys.exit(0)
+          print('NO_DOMAIN')
+          " 2>/dev/null || echo 'PARSE_ERROR')
+            echo "::notice::svc=${SVC_ID} domain=${DOMAIN}"
+          done

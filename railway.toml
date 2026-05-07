@@ -1,0 +1,16 @@
+# railway.toml — Agent (TypeScript Skills Router) service
+#
+# This file configures the `agent` Railway service only.
+# The n8n service uses a separate configuration: railway.n8n.toml
+# Both services are linked to this repository in the Railway dashboard.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "node dist/agent/index.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

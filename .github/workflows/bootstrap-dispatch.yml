@@ -1,0 +1,1070 @@
+name: Bootstrap (dispatch)
+
+# Triggered manually from the GitHub Actions UI.
+# Replaces tools/bootstrap.sh for web-based environments (no local CLI required).
+#
+# Prerequisites — set these in GitHub before triggering:
+#
+# GitHub SECRETS (Settings → Secrets → Actions):
+#   TELEGRAM_BOT_TOKEN          from @BotFather
+#   CLOUDFLARE_API_TOKEN        from Cloudflare dashboard (one-time manual)
+#   OPENROUTER_MANAGEMENT_KEY   from OpenRouter settings
+#   RAILWAY_API_TOKEN           from Railway account settings (account token)
+#
+# GitHub VARIABLES (Settings → Variables → Actions):
+#   GCP_PROJECT_ID
+#   GCP_WORKLOAD_IDENTITY_PROVIDER
+#   GCP_SERVICE_ACCOUNT_EMAIL
+#   GCP_REGION                  (default: us-central1)
+#   APP_INSTALLATION_ID         (name cannot start with GITHUB_ — see CLAUDE.md)
+#   CLOUDFLARE_ACCOUNT_ID
+#   CLOUDFLARE_ZONE_ID
+#   RAILWAY_PROJECT_ID
+#   RAILWAY_ENVIRONMENT_ID
+#   RAILWAY_N8N_SERVICE_ID
+#   RAILWAY_AGENT_SERVICE_ID
+#   TELEGRAM_CHAT_ID
+#   TF_STATE_BUCKET             GCS bucket name for Terraform state
+#   N8N_OWNER_EMAIL             (default: ops@example.com)
+#   APP_NAME                    Desired GitHub App name (e.g. "my-agent")
+#   (App owner is auto-set from github.repository_owner — GitHub forbids
+#   user-set Variables with the GITHUB_ prefix.)
+#   WEBHOOK_URL                 n8n webhook URL for GitHub events (set after n8n is deployed)
+
+on:
+  push:  # Required Workflow push events — all jobs guarded by event_name check below
+  workflow_dispatch:
+    inputs:
+      skip_terraform:
+        description: 'Skip terraform apply (plan only)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      skip_railway:
+        description: 'Skip Railway variable injection'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      dry_run:
+        description: 'Dry run — print what would happen, make no changes'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+  # repository_dispatch allows activate-clone to trigger bootstrap using
+  # contents:write (Provisioner App has this) instead of actions:write (it doesn't).
+  # Inputs default to 'false' when triggered via repository_dispatch (empty = !='true').
+  repository_dispatch:
+    types: [bootstrap]
+
+permissions:
+  contents: read
+  id-token: write   # Required for WIF authentication to GCP
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION:     ${{ vars.GCP_REGION || 'us-central1' }}
+
+jobs:
+  # ─── Required Workflow push-event absorber ─────────────────────────────────
+  # Org Required Workflow fires this on every push. All real bootstrap jobs are
+  # guarded to skip on push events. This job provides the required "success"
+  # conclusion so the required check passes without doing any bootstrap work.
+  push-noop:
+    name: Push event — bootstrap skipped
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - run: echo "Bootstrap skipped for push event (org Required Workflow check)"
+
+  # ─── Phase 1: Generate secrets and inject into GCP Secret Manager ──────────
+  generate-and-inject-secrets:
+    name: Generate secrets + inject into Secret Manager
+    runs-on: ubuntu-latest
+    # Skip org Required Workflow push events; only run on explicit dispatch.
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Diagnostics (pre-auth)
+        run: |
+          {
+            echo "## Bootstrap Phase 1 Diagnostics"
+            echo ""
+            echo "| Variable | Set? |"
+            echo "|----------|------|"
+            echo "| \`GCP_WORKLOAD_IDENTITY_PROVIDER\` | ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && '✅' || '❌ empty' }} |"
+            echo "| \`GCP_PROJECT_ID\` | ${{ vars.GCP_PROJECT_ID != '' && '✅' || '❌ empty' }} |"
+            echo "| \`GCP_SERVICE_ACCOUNT_EMAIL\` | ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL != '' && '✅' || '❌ empty' }} |"
+            echo "| \`TF_STATE_BUCKET\` | ${{ vars.TF_STATE_BUCKET != '' && '✅' || '❌ empty' }} |"
+            echo ""
+            echo "| Trigger | Value |"
+            echo "|---------|-------|"
+            echo "| Event | \`${{ github.event_name }}\` |"
+            echo "| Actor | \`${{ github.actor }}\` |"
+            echo "| Ref | \`${{ github.ref }}\` |"
+            echo "| Skip Terraform | \`${{ inputs.skip_terraform }}\` |"
+            echo "| Skip Railway | \`${{ inputs.skip_railway }}\` |"
+            echo "| Dry Run | \`${{ inputs.dry_run }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Authenticate to GCP (WIF)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Authenticate to GCP (SA key — first bootstrap)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER == ''
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Enable required GCP APIs
+        if: inputs.dry_run != 'true'
+        run: |
+          gcloud services enable \
+            iam.googleapis.com \
+            iamcredentials.googleapis.com \
+            secretmanager.googleapis.com \
+            sts.googleapis.com \
+            cloudresourcemanager.googleapis.com \
+            storage.googleapis.com \
+            run.googleapis.com \
+            artifactregistry.googleapis.com \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet
+
+      - name: Generate n8n encryption key
+        id: n8n-key
+        run: |
+          # Re-use the existing key if Secret Manager already has one.
+          # Generating a new key on re-runs rotates the key, which breaks
+          # n8n's SQLite/Postgres encryption and causes an immediate crash
+          # (n8n can't decrypt its existing credential store with a new key).
+          EXISTING="$(gcloud secrets versions access latest \
+            --secret="n8n-encryption-key" \
+            --project="${GCP_PROJECT_ID}" 2>/dev/null || true)"
+          if [ -n "${EXISTING}" ]; then
+            echo "::add-mask::${EXISTING}"
+            echo "key=${EXISTING}" >> "$GITHUB_OUTPUT"
+            echo "↷ Using existing n8n-encryption-key from Secret Manager (idempotent re-run)"
+          else
+            KEY="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+            echo "::add-mask::${KEY}"
+            echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate n8n admin password + bcrypt hash
+        id: n8n-password
+        run: |
+          # Re-use the existing hash: a new hash on re-run silently invalidates
+          # the operator's saved plaintext copy.
+          EXISTING_HASH="$(gcloud secrets versions access latest \
+            --secret="n8n-admin-password-hash" \
+            --project="${GCP_PROJECT_ID}" 2>/dev/null || true)"
+          # A corrupted/non-bcrypt value in SM silently propagates to n8n, which
+          # opens port 5678 (Railway marks SUCCESS), then crashes applying the hash.
+          if [[ "${EXISTING_HASH}" =~ ^\$2[aby]\$[0-9]{2}\$ ]] && [ "${#EXISTING_HASH}" -eq 60 ]; then
+            echo "::add-mask::${EXISTING_HASH}"
+            echo "hash=${EXISTING_HASH}" >> "$GITHUB_OUTPUT"
+            echo "password=" >> "$GITHUB_OUTPUT"
+            echo "↷ Using existing n8n-admin-password-hash from Secret Manager (idempotent re-run)"
+          else
+            [ -n "${EXISTING_HASH}" ] && echo "::warning::Existing n8n-admin-password-hash in SM is not a valid bcrypt string — regenerating"
+            PASSWORD="$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")"
+            echo "::add-mask::${PASSWORD}"
+
+            pip3 install bcrypt --quiet
+            HASH="$(python3 - "${PASSWORD}" <<'PYEOF'
+          import bcrypt, sys
+          pwd = sys.argv[1].encode()
+          h = bcrypt.hashpw(pwd, bcrypt.gensalt(10)).decode()
+          print(h)
+          PYEOF
+            )"
+            echo "::add-mask::${HASH}"
+            echo "password=${PASSWORD}" >> "$GITHUB_OUTPUT"
+            echo "hash=${HASH}"         >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate n8n secrets broker token
+        id: broker-token
+        run: |
+          EXISTING="$(gcloud secrets versions access latest \
+            --secret="n8n-secrets-broker-token" \
+            --project="${GCP_PROJECT_ID}" 2>/dev/null || true)"
+          if [ -n "${EXISTING}" ]; then
+            echo "::add-mask::${EXISTING}"
+            echo "token=${EXISTING}" >> "$GITHUB_OUTPUT"
+            echo "↷ Using existing n8n-secrets-broker-token from Secret Manager (idempotent re-run)"
+          else
+            TOKEN="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+            echo "::add-mask::${TOKEN}"
+            echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Inject secrets into GCP Secret Manager
+        if: inputs.dry_run != 'true'
+        run: |
+          inject_secret() {
+            local name="$1"
+            local value="$2"
+            # Skip empty values: gcloud rejects empty --data-file=- payloads.
+            # Empty inputs are expected on first dispatch when an operator-
+            # provided variable hasn't been pasted yet (e.g.
+            # `vars.APP_INSTALLATION_ID` — empty until the GitHub App is
+            # installed and the operator pastes the install ID).
+            if [ -z "${value}" ]; then
+              echo "↷ Skipping ${name} (empty value — will be populated by a later phase)"
+              return 0
+            fi
+            if gcloud secrets describe "${name}" --project="${GCP_PROJECT_ID}" &>/dev/null; then
+              printf '%s' "${value}" | gcloud secrets versions add "${name}" \
+                --project="${GCP_PROJECT_ID}" --data-file=-
+            else
+              gcloud secrets create "${name}" \
+                --project="${GCP_PROJECT_ID}" --replication-policy=automatic
+              printf '%s' "${value}" | gcloud secrets versions add "${name}" \
+                --project="${GCP_PROJECT_ID}" --data-file=-
+            fi
+            echo "✅ Secret stored: ${name}"
+          }
+
+          # Generated secrets
+          inject_secret "n8n-encryption-key"           "${{ steps.n8n-key.outputs.key }}"
+          inject_secret "n8n-admin-password-hash"      "${{ steps.n8n-password.outputs.hash }}"
+          inject_secret "n8n-admin-password-plaintext" "${{ steps.n8n-password.outputs.password }}"
+          inject_secret "n8n-secrets-broker-token"     "${{ steps.broker-token.outputs.token }}"
+
+          # Human-provided secrets (from GitHub Secrets)
+          inject_secret "telegram-bot-token"         "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          inject_secret "cloudflare-api-token"       "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          inject_secret "cloudflare-account-id"      "${{ vars.CLOUDFLARE_ACCOUNT_ID }}"
+          inject_secret "openrouter-management-key"  "${{ secrets.OPENROUTER_MANAGEMENT_KEY }}"
+          inject_secret "github-app-installation-id" "${{ vars.APP_INSTALLATION_ID }}"
+          inject_secret "railway-api-token"          "${{ secrets.RAILWAY_API_TOKEN }}"
+          # Linear L-pool — ADR-0011 §4
+          inject_secret "linear-api-key"             "${{ secrets.LINEAR_API_KEY }}"
+          inject_secret "linear-webhook-secret"      "${{ secrets.LINEAR_WEBHOOK_SECRET }}"
+          inject_secret "linear-team-id"             "${{ secrets.LINEAR_TEAM_ID }}"
+
+          # github-app-id + github-app-private-key + github-app-webhook-secret
+          # are NOT injected here — the Cloud Run receiver writes them directly
+          # to Secret Manager in Phase 4 (github-app-registration job).
+
+          echo "✅ All secrets injected into GCP Secret Manager."
+
+      - name: Provision OpenRouter runtime key (daily $10 cap, ADR-0004)
+        # `secrets.*` is not available in step-level `if:` contexts.
+        if: inputs.dry_run != 'true'
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: bash tools/provision-openrouter-runtime-key.sh
+
+      - name: Dry run — show what would be injected
+        if: inputs.dry_run == 'true'
+        run: |
+          echo "DRY RUN — would inject the following secrets:"
+          echo "  n8n-encryption-key           (auto-generated)"
+          echo "  n8n-admin-password-hash      (auto-generated bcrypt)"
+          echo "  n8n-admin-password-plaintext (auto-generated)"
+          echo "  n8n-secrets-broker-token     (auto-generated hex-32)"
+          echo "  telegram-bot-token        (from GitHub Secret)"
+          echo "  cloudflare-api-token      (from GitHub Secret)"
+          echo "  cloudflare-account-id     (from GitHub Variable)"
+          echo "  openrouter-management-key (from GitHub Secret)"
+          echo "  github-app-installation-id (from GitHub Variable APP_INSTALLATION_ID)"
+          echo "  railway-api-token         (from GitHub Secret)"
+          echo "  github-app-* trio         (auto-injected by Cloud Run receiver in Phase 4)"
+
+  # ─── Phase 2: Terraform apply ──────────────────────────────────────────────
+  terraform-apply:
+    name: Terraform apply
+    runs-on: ubuntu-latest
+    needs: [generate-and-inject-secrets]
+    if: inputs.skip_terraform != 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (WIF)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Authenticate to GCP (SA key — first bootstrap)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER == ''
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.9"
+
+      - name: Terraform init
+        run: |
+          terraform -chdir=terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=terraform/state" \
+            -input=false
+
+      # Pre-import any pre-existing Secret Manager containers into the
+      # terraform state. grant-autonomy.sh (Phase E provisioning) and
+      # bootstrap-dispatch.yml Phase 1 (`generate-and-inject-secrets`) both create
+      # secret containers BEFORE Phase 2 runs. terraform/gcp.tf:96 then
+      # tries to re-create them and fails with `Error 409: Secret already
+      # exists`. Pre-importing makes Phase 2 idempotent across re-runs and
+      # against pre-provisioned secret containers.
+      - name: Pre-import existing secrets
+        env:
+          # `terraform import` reads variables identically to plan/apply. Without
+          # these env vars it prompts interactively for every required `var.*`
+          # and hangs the CI runner forever (no stdin). -input=false on the
+          # import call also forces non-interactive — both belt and suspenders.
+          TF_VAR_gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+          TF_VAR_gcp_region: ${{ vars.GCP_REGION || 'us-central1' }}
+          TF_VAR_github_repo: ${{ github.repository }}
+          TF_VAR_github_org: ${{ github.repository_owner }}
+          TF_VAR_terraform_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+          TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID || '' }}
+          TF_VAR_clone_slug: ${{ github.event.repository.name }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          TF_SECRETS=$(awk '/variable "secret_names"/,/^}/' terraform/variables.tf \
+            | grep -oE '"[a-z][a-z0-9-]*"' | tr -d '"' | sort -u)
+          GCP_SECRETS=$(gcloud secrets list \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --format='value(name.basename())' 2>/dev/null | sort -u || echo '')
+          for name in $TF_SECRETS; do
+            if echo "${GCP_SECRETS}" | grep -qx "${name}"; then
+              echo "Importing pre-existing secret: ${name}"
+              terraform -chdir=terraform import -input=false \
+                "google_secret_manager_secret.secrets[\"${name}\"]" \
+                "projects/${{ vars.GCP_PROJECT_ID }}/secrets/${name}" || true
+            fi
+          done
+          # The Terraform state bucket itself is created by grant-autonomy.sh
+          # before this workflow runs (the TF backend needs it to exist before
+          # `terraform init`). Pre-import it too so terraform/gcp.tf:114 doesn't
+          # 409 with "you already own it".
+          if gcloud storage buckets describe "gs://${{ vars.TF_STATE_BUCKET }}" --project="${{ vars.GCP_PROJECT_ID }}" >/dev/null 2>&1; then
+            echo "Importing pre-existing bucket: ${{ vars.TF_STATE_BUCKET }}"
+            terraform -chdir=terraform import -input=false \
+              google_storage_bucket.tf_state "${{ vars.TF_STATE_BUCKET }}" || true
+          fi
+
+      - name: Terraform plan
+        id: plan
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          terraform -chdir=terraform plan \
+            -var="gcp_project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="gcp_region=${{ vars.GCP_REGION || 'us-central1' }}" \
+            -var="github_repo=${{ github.repository }}" \
+            -var="github_org=${{ github.repository_owner }}" \
+            -var="terraform_state_bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -var="cloudflare_zone_id=${{ vars.CLOUDFLARE_ZONE_ID || '' }}" \
+            -var="clone_slug=${{ github.event.repository.name }}" \
+            -no-color \
+            -out=tfplan 2>&1 | tee /tmp/plan_output.txt
+
+      - name: Terraform apply
+        if: inputs.dry_run != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: terraform -chdir=terraform apply -auto-approve tfplan
+
+      - name: Output WIF provider name
+        if: inputs.dry_run != 'true'
+        run: |
+          set +e
+          terraform -chdir=terraform output -json > /tmp/tf_outputs.json 2>/tmp/tf_outputs.err
+          EC=$?
+          if [ "$EC" -ne 0 ]; then
+            echo "::warning::terraform output -json failed (exit $EC) — Variables remain as set by grant-autonomy.sh"
+            sed -n '1,10p' /tmp/tf_outputs.err | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::warning::tf output stderr: ${line}"
+            done
+            exit 0
+          fi
+          {
+            echo "## Terraform Outputs"
+            echo ""
+            echo "Set these as GitHub repository variables:"
+            echo ""
+            jq -r 'to_entries[] | select(.value.value | type == "string") | "- `\(.key)` = `\(.value.value)`"' /tmp/tf_outputs.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Auto-update GitHub variables and remove SA key
+        if: inputs.dry_run != 'true'
+        env:
+          GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+        run: |
+          TF_OUT="$(terraform -chdir=terraform output -json 2>/dev/null || echo '{}')"
+          TF_VALS="$(echo "${TF_OUT}" | python3 -c "import json, sys; d = json.load(sys.stdin); print(d.get('wif_provider_name',{}).get('value','')); print(d.get('service_account_email',{}).get('value',''))" 2>/dev/null || printf '\n')"
+          WIF="$(echo "${TF_VALS}" | head -1)"
+          SA="$(echo "${TF_VALS}"  | tail -1)"
+          REPO="${GITHUB_REPOSITORY}"
+
+          upsert_var() {
+            local name="$1" value="$2"
+            [[ -z "${value}" || -z "${GH_ADMIN_TOKEN:-}" ]] && return
+            if curl -sf -X PATCH \
+                "https://api.github.com/repos/${REPO}/actions/variables/${name}" \
+                -H "Authorization: Bearer ${GH_ADMIN_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -d "{\"name\":\"${name}\",\"value\":\"${value}\"}" >/dev/null 2>&1 || \
+               curl -sf -X POST \
+                "https://api.github.com/repos/${REPO}/actions/variables" \
+                -H "Authorization: Bearer ${GH_ADMIN_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -d "{\"name\":\"${name}\",\"value\":\"${value}\"}" >/dev/null 2>&1; then
+              echo "✅ GitHub variable updated: ${name}"
+            else
+              echo "⚠  Could not update GitHub variable: ${name}" >&2
+            fi
+          }
+
+          upsert_var "GCP_WORKLOAD_IDENTITY_PROVIDER" "${WIF}"
+          upsert_var "GCP_SERVICE_ACCOUNT_EMAIL"       "${SA}"
+
+          if [[ -n "${WIF}" && -n "${GH_ADMIN_TOKEN:-}" ]]; then
+            curl -sf -X DELETE \
+              "https://api.github.com/repos/${REPO}/actions/secrets/GOOGLE_CREDENTIALS" \
+              -H "Authorization: Bearer ${GH_ADMIN_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" >/dev/null 2>&1 || true
+            echo "🗑️  GOOGLE_CREDENTIALS secret deleted — WIF is now the identity backbone"
+          fi
+
+  # ─── Phase 3: Railway environment variable injection ───────────────────────
+  inject-railway-variables:
+    name: Inject Railway environment variables
+    runs-on: ubuntu-latest
+    needs: [generate-and-inject-secrets]
+    if: inputs.skip_railway != 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
+
+    steps:
+      - name: Authenticate to GCP (WIF)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Authenticate to GCP (SA key — first bootstrap)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER == ''
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Retrieve secrets from Secret Manager
+        id: secrets
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          fetch() { gcloud secrets versions access latest --secret="$1" --project="${GCP_PROJECT_ID}"; }
+          fetch_optional() { gcloud secrets versions access latest --secret="$1" --project="${GCP_PROJECT_ID}" 2>/dev/null || echo ""; }
+          N8N_KEY="$(fetch n8n-encryption-key)"
+          N8N_HASH="$(fetch n8n-admin-password-hash)"
+          OR_RUNTIME="$(fetch_optional openrouter-runtime-key)"
+          OR_MGMT="$(fetch_optional openrouter-management-key)"
+          # Railway IDs are written by apply-railway-provision.yml (ADR-0009).
+          # Storage moved from GitHub Variables to GCP Secret Manager because
+          # GITHUB_TOKEN cannot manage repo Variables (no `variables:write`
+          # permissions:); the runtime SA already has secretmanager.admin.
+          RAILWAY_PROJECT="$(fetch_optional railway-project-id)"
+          RAILWAY_ENV="$(fetch_optional railway-environment-id)"
+          RAILWAY_N8N="$(fetch_optional railway-n8n-service-id)"
+          RAILWAY_AGENT="$(fetch_optional railway-agent-service-id)"
+          # Account-level token written by apply-railway-spec.yml (Issue 9 fix).
+          # Required for variableCollectionUpsert — project-scoped tokens lack
+          # variable-write permission ("Not Authorized" on that mutation).
+          RAILWAY_API_TOKEN_VAL="$(fetch_optional railway-api-token)"
+          # Project-scoped token minted by apply-railway-spec.yml (PR #81).
+          # Kept as fallback; not used for variable injection.
+          RAILWAY_PROJECT_TOKEN="$(fetch_optional railway-project-token)"
+          # Written by apply-railway-spec.yml when n8n is in the spec.
+          # Guards DB_TYPE=postgresdb injection below — n8n crashes if
+          # this is set but no Postgres service exists in the project.
+          RAILWAY_POSTGRES="$(fetch_optional railway-postgres-service-id)"
+          echo "::add-mask::${N8N_KEY}"
+          echo "::add-mask::${N8N_HASH}"
+          [ -n "${OR_RUNTIME}" ]              && echo "::add-mask::${OR_RUNTIME}"
+          [ -n "${OR_MGMT}" ]                 && echo "::add-mask::${OR_MGMT}"
+          [ -n "${RAILWAY_API_TOKEN_VAL}" ]   && echo "::add-mask::${RAILWAY_API_TOKEN_VAL}"
+          [ -n "${RAILWAY_PROJECT_TOKEN}" ]   && echo "::add-mask::${RAILWAY_PROJECT_TOKEN}"
+          echo "n8n_key=${N8N_KEY}"           >> "$GITHUB_OUTPUT"
+          echo "n8n_hash=${N8N_HASH}"         >> "$GITHUB_OUTPUT"
+          echo "openrouter_runtime_key=${OR_RUNTIME}" >> "$GITHUB_OUTPUT"
+          echo "openrouter_management_key=${OR_MGMT}" >> "$GITHUB_OUTPUT"
+          echo "railway_project_id=${RAILWAY_PROJECT}"           >> "$GITHUB_OUTPUT"
+          echo "railway_environment_id=${RAILWAY_ENV}"           >> "$GITHUB_OUTPUT"
+          echo "railway_n8n_service_id=${RAILWAY_N8N}"           >> "$GITHUB_OUTPUT"
+          echo "railway_agent_service_id=${RAILWAY_AGENT}"       >> "$GITHUB_OUTPUT"
+          echo "railway_api_token=${RAILWAY_API_TOKEN_VAL}"      >> "$GITHUB_OUTPUT"
+          echo "railway_project_token=${RAILWAY_PROJECT_TOKEN}"  >> "$GITHUB_OUTPUT"
+          echo "railway_postgres_service_id=${RAILWAY_POSTGRES}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject Railway service variables
+        if: >-
+          (steps.secrets.outputs.railway_n8n_service_id != '' ||
+           steps.secrets.outputs.railway_agent_service_id != '') &&
+          inputs.dry_run != 'true'
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, traceback, urllib.request
+          from urllib.parse import urlparse
+
+          TOKEN   = "${{ steps.secrets.outputs.railway_api_token || steps.secrets.outputs.railway_project_token || secrets.RAILWAY_API_TOKEN }}"
+          PROJECT = "${{ steps.secrets.outputs.railway_project_id }}"
+          ENV_ID  = "${{ steps.secrets.outputs.railway_environment_id }}"
+
+          MUTATION = """
+          mutation variableCollectionUpsert($input: VariableCollectionUpsertInput!) {
+            variableCollectionUpsert(input: $input)
+          }
+          """
+
+          def upsert_variables(label, svc_id, variables):
+            payload = json.dumps({
+              "query": MUTATION,
+              "variables": {"input": {"projectId": PROJECT, "environmentId": ENV_ID, "serviceId": svc_id, "variables": variables}},
+            }).encode()
+            req = urllib.request.Request(
+              "https://backboard.railway.app/graphql/v2",
+              data=payload,
+              headers={
+                "Authorization": f"Bearer {TOKEN}",
+                "Content-Type":  "application/json",
+                # Cloudflare on backboard.railway.app rejects the default
+                # Python-urllib UA with HTTP 403 / error code 1010 (Browser
+                # Integrity Check). Confirmed live in probe-railway.yml run
+                # 25214858636. UA + Accept passes.
+                "Accept":        "application/json",
+                "User-Agent":    "autonomous-agent-template-builder/1.0 (+bootstrap-dispatch.yml)",
+              },
+              method="POST",
+            )
+            try:
+              with urllib.request.urlopen(req) as resp:
+                result = json.loads(resp.read())
+            except Exception as exc:
+              print(f"::error::{label} Railway HTTP error: {exc}", flush=True)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                f.write(f"## ❌ Inject {label} Railway variables — HTTP error\n\n```\n{traceback.format_exc()}\n```\n")
+              sys.exit(1)
+            if (result.get("data") or {}).get("variableCollectionUpsert"):
+              print(f"✅ {label} Railway variables injected (atomic variableCollectionUpsert)")
+            else:
+              detail = json.dumps(result, indent=2)
+              print(f"::error::Railway {label} GraphQL non-success: {json.dumps(result)[:400]}", flush=True)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                f.write(f"## ❌ Inject {label} Railway variables failed\n\n```json\n{detail}\n```\n")
+              sys.exit(1)
+
+          # ── n8n service ───────────────────────────────────────────────────────
+          n8n_svc = "${{ steps.secrets.outputs.railway_n8n_service_id }}"
+          if n8n_svc:
+            # Strip path from "https://<domain>/webhook/github" → "https://<domain>/".
+            # N8N_PROTOCOL=https must not be set — Railway terminates TLS externally;
+            # n8n without SSL certs crashes on startup if told to bind HTTPS.
+            parsed = urlparse("${{ vars.WEBHOOK_URL }}")
+            n8n_base_url = f"{parsed.scheme}://{parsed.netloc}/" if parsed.netloc else ""
+            upsert_variables("n8n", n8n_svc, {
+              "N8N_ENCRYPTION_KEY":                  "${{ steps.secrets.outputs.n8n_key }}",
+              "N8N_INSTANCE_OWNER_MANAGED_BY_ENV":   "true",
+              "N8N_INSTANCE_OWNER_EMAIL":            "${{ vars.N8N_OWNER_EMAIL || 'ops@example.com' }}",
+              "N8N_INSTANCE_OWNER_FIRST_NAME":       "Instance",
+              "N8N_INSTANCE_OWNER_LAST_NAME":        "Owner",
+              "N8N_INSTANCE_OWNER_PASSWORD_HASH":    "${{ steps.secrets.outputs.n8n_hash }}",
+              "N8N_RUNNERS_ENABLED":                 "false",
+              "N8N_PORT":                            "5678",
+              # Individual DB_POSTGRESDB_* vars only when apply-railway-spec.yml has
+              # provisioned Postgres and written railway-postgres-service-id to SM.
+              # n8n does NOT support DATABASE_URL or DB_POSTGRESDB_URL — only the
+              # individual DB_POSTGRESDB_{HOST,PORT,DATABASE,USER,PASSWORD,SSL_*} vars
+              # (see n8n config schema). ${{Postgres.X}} Railway reference variables
+              # resolve to the Postgres service's actual values at runtime.
+              **( {"DB_TYPE":                              "postgresdb",
+                   "DB_POSTGRESDB_HOST":                   "${{ '${{' }}Postgres.RAILWAY_PRIVATE_DOMAIN}}",
+                   "DB_POSTGRESDB_PORT":                   "5432",
+                   "DB_POSTGRESDB_DATABASE":               "${{ '${{' }}Postgres.POSTGRES_DB}}",
+                   "DB_POSTGRESDB_USER":                   "${{ '${{' }}Postgres.POSTGRES_USER}}",
+                   "DB_POSTGRESDB_PASSWORD":               "${{ '${{' }}Postgres.POSTGRES_PASSWORD}}",
+                   "DB_POSTGRESDB_SSL_ENABLED":            "true",
+                   "DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED": "false"}
+                  if "${{ steps.secrets.outputs.railway_postgres_service_id }}" else {} ),
+              **({"WEBHOOK_URL": n8n_base_url, "N8N_EDITOR_BASE_URL": n8n_base_url} if n8n_base_url else {}),
+            })
+
+          # ── agent service ─────────────────────────────────────────────────────
+          agent_svc = "${{ steps.secrets.outputs.railway_agent_service_id }}"
+          if agent_svc:
+            upsert_variables("agent", agent_svc, {
+              "GCP_PROJECT_ID":            "${{ vars.GCP_PROJECT_ID }}",
+              "OPENROUTER_BASE_URL":       "https://openrouter.ai/api/v1",
+              "OPENROUTER_DAILY_BUDGET_USD": "10",
+              "TELEGRAM_WEBHOOK_PATH":     "/webhook/telegram",
+              "TELEGRAM_CHAT_ID":          "${{ vars.TELEGRAM_CHAT_ID }}",
+              # ── ADR-0004 runtime guardrails ───────────────────────────────
+              "OPENROUTER_RUNTIME_KEY":          "${{ steps.secrets.outputs.openrouter_runtime_key }}",
+              "OPENROUTER_MANAGEMENT_KEY":       "${{ steps.secrets.outputs.openrouter_management_key }}",
+              "OPENROUTER_BUDGET_THRESHOLD_USD": "1.0",
+              "OPENROUTER_BUDGET_FAIL_OPEN":     "false",
+              "RATE_LIMIT_MAX":                  "20",
+              "RATE_LIMIT_WINDOW_MS":            "60000",
+            })
+          PYEOF
+
+      - name: Dry run summary
+        if: inputs.dry_run == 'true'
+        run: |
+          echo "DRY RUN — would inject Railway variables via variableCollectionUpsert:"
+          echo "  n8n service: N8N_ENCRYPTION_KEY, N8N_INSTANCE_OWNER_*, N8N_RUNNERS_ENABLED, N8N_PORT, WEBHOOK_URL (base), N8N_EDITOR_BASE_URL"
+          echo "  agent service: GCP_PROJECT_ID, OPENROUTER_*, TELEGRAM_*"
+
+  # ─── Phase 4: GitHub App registration via Cloud Run receiver ──────────────
+  github-app-registration:
+    name: Register GitHub App (2-click)
+    runs-on: ubuntu-latest
+    needs: [generate-and-inject-secrets]
+    if: inputs.dry_run != 'true' && vars.APP_NAME != '' && (github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (WIF)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Authenticate to GCP (SA key — first bootstrap)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER == ''
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Check if GitHub App secrets already exist
+        id: check-secrets
+        run: |
+          # Check for an actual VERSION, not just the container — terraform/gcp.tf
+          # creates the containers via `for_each = toset(var.secret_names)` even
+          # when no value has been set yet (Phase 2 always creates the empty
+          # container). The original `gcloud secrets describe` returned success
+          # on container-only state and made Phase 4 silently skip the actual
+          # App registration. `versions access latest` requires both container
+          # AND at least one populated version, matching the polling check
+          # logic below.
+          if gcloud secrets versions access latest \
+              --secret=github-app-id \
+              --project="${GCP_PROJECT_ID}" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ GitHub App secrets already populated — skipping registration."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push receiver image
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          gcloud artifacts repositories create bootstrap-images \
+            --repository-format=docker \
+            --location="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet 2>/dev/null || true
+
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/bootstrap-images/receiver:latest"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+          docker build -t "${IMAGE}" src/bootstrap-receiver/
+          docker push "${IMAGE}"
+
+      - name: Pre-flight — require WEBHOOK_URL repo variable
+        if: steps.check-secrets.outputs.exists == 'false'
+        env:
+          WEBHOOK_URL_VAR: ${{ vars.WEBHOOK_URL }}
+        run: |
+          if [ -z "${WEBHOOK_URL_VAR}" ]; then
+            echo "❌ WEBHOOK_URL repo variable is not set."
+            echo "   The GitHub App webhook URL is baked into the App at registration time"
+            echo "   and cannot be changed without manual GitHub UI surgery."
+            echo ""
+            echo "   Set the WEBHOOK_URL repo variable to your n8n webhook URL, e.g.:"
+            echo "     gh variable set WEBHOOK_URL --body 'https://<n8n-host>/webhook/github'"
+            echo ""
+            echo "   Then re-run this workflow."
+            exit 1
+          fi
+          echo "✅ WEBHOOK_URL set."
+
+      - name: Grant runtime SA actAs on itself (Cloud Run deploy requirement)
+        if: steps.check-secrets.outputs.exists == 'false'
+        env:
+          SA_EMAIL: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+        run: |
+          # Cloud Run deploy needs `iam.serviceAccounts.actAs` on the SA
+          # the new service runs as. Even when that SA is the deployer
+          # itself (--service-account = SA running this workflow), GCP does
+          # NOT grant this implicitly. Idempotent: add-iam-policy-binding
+          # is a no-op if the binding already exists.
+          gcloud iam service-accounts add-iam-policy-binding "${SA_EMAIL}" \
+            --member="serviceAccount:${SA_EMAIL}" \
+            --role="roles/iam.serviceAccountUser" \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet
+
+      - name: Deploy Cloud Run receiver (no redirect URL yet)
+        id: deploy
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          SERVICE_NAME="github-app-bootstrap-receiver"
+
+          set +e
+          gcloud run deploy "${SERVICE_NAME}" \
+            --image="${IMAGE}" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --allow-unauthenticated \
+            --service-account="${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}" \
+            --set-env-vars="GCP_PROJECT_ID=${GCP_PROJECT_ID},GITHUB_ORG=${{ github.repository_owner }},APP_NAME=${{ vars.APP_NAME }},WEBHOOK_URL=${{ vars.WEBHOOK_URL }},GITHUB_REPO=${{ github.repository }}" \
+            --quiet 2>&1 | tee /tmp/run_deploy.log
+          EC=${PIPESTATUS[0]}
+          if [ "$EC" -ne 0 ]; then
+            tail -40 /tmp/run_deploy.log | sed 's/\x1b\[[0-9;]*m//g' | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              clean="${line//$'\r'/}"
+              echo "::error::cloud-run-deploy: ${clean:0:300}"
+            done
+            exit "$EC"
+          fi
+          # Continue capturing stderr from subsequent gcloud calls — any
+          # one of them (describe, update, add-iam-policy-binding) can fail
+          # with the same blob.core.windows.net visibility limitation.
+          run_diag() {
+            local LABEL="$1"; shift
+            "$@" 2>&1 | tee /tmp/gcloud_step.log
+            local EC=${PIPESTATUS[0]}
+            if [ "$EC" -ne 0 ]; then
+              tail -25 /tmp/gcloud_step.log | sed 's/\x1b\[[0-9;]*m//g' | while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                clean="${line//$'\r'/}"
+                echo "::error::${LABEL}: ${clean:0:300}"
+              done
+              exit "$EC"
+            fi
+          }
+
+          SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+            --platform=managed --region="${GCP_REGION}" --project="${GCP_PROJECT_ID}" \
+            --format='value(status.url)')"
+          echo "SERVICE_URL=${SERVICE_URL}" >> "$GITHUB_ENV"
+
+          run_diag "services-update-redirect" gcloud run services update "${SERVICE_NAME}" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --update-env-vars="REDIRECT_URL=${SERVICE_URL}/callback" \
+            --quiet
+
+          # `--allow-unauthenticated` on `gcloud run deploy` only configures
+          # IAM allUsers binding when the deployer has `roles/run.admin`.
+          # The runtime SA typically only has `roles/run.developer`, so the
+          # flag silently no-ops. Apply the binding explicitly.
+          run_diag "add-iam-policy-binding" gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --member=allUsers \
+            --role=roles/run.invoker \
+            --quiet
+
+      - name: Probe health endpoint
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          echo "Waiting for receiver to become healthy at ${SERVICE_URL}/health"
+          LAST_HTTP=""
+          LAST_BODY=""
+          # 24 retries × 5s = 120s — covers Cloud Run cold start + the
+          # `services update` restart triggered by adding REDIRECT_URL.
+          for i in $(seq 1 24); do
+            RESP=$(curl -sS -m 8 -o /tmp/probe.body -w "%{http_code}" "${SERVICE_URL}/health" 2>&1)
+            LAST_HTTP="$RESP"
+            LAST_BODY=$(head -c 200 /tmp/probe.body 2>/dev/null)
+            if [ "$RESP" = "200" ]; then
+              echo "✅ Receiver healthy after ${i} attempt(s). body=${LAST_BODY}"
+              exit 0
+            fi
+            echo "  Attempt ${i}/24 — HTTP=${RESP} body=${LAST_BODY:0:80}"
+            sleep 5
+          done
+          echo "::error::Receiver health check failed after 120s — last HTTP=${LAST_HTTP} body=${LAST_BODY}"
+          exit 1
+
+      - name: Print operator instruction
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          # Also emit URL as a ::notice:: annotation so it's readable from
+          # /check-runs/{id}/annotations API (the Step Summary itself is
+          # not exposed via the REST API, only the UI).
+          echo "::notice::Operator URL — open in browser to register GitHub App: ${SERVICE_URL}"
+          echo "## GitHub App Registration — Human Action Required" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Open this URL in your browser** (you must be a GitHub org admin):" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "👉 **[Start GitHub App registration](${SERVICE_URL})**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The page auto-submits to GitHub. Click **\"Create GitHub App\"** — that's click 1." >> "$GITHUB_STEP_SUMMARY"
+          echo "Then click **\"Install\"** on the next page — that's click 2." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "All credentials are written to GCP Secret Manager automatically. You never see the private key." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_This job will poll for up to 10 minutes. After both clicks, the workflow continues automatically._" >> "$GITHUB_STEP_SUMMARY"
+
+          echo ""
+          echo "====================================================="
+          echo "ACTION REQUIRED: Open ${SERVICE_URL} in your browser."
+          echo "Click 'Create GitHub App' then 'Install'."
+          echo "====================================================="
+
+      - name: Poll Secret Manager for github-app-id + github-app-installation-id (up to 10 min each)
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          poll_secret() {
+            local secret="$1" label="$2" hint="$3"
+            echo "Polling for ${secret} (20 retries × 30s = 10 min max)..."
+            for i in $(seq 1 20); do
+              if gcloud secrets versions access latest \
+                  --secret="${secret}" \
+                  --project="${GCP_PROJECT_ID}" &>/dev/null; then
+                echo "✅ ${label} after ${i} poll(s)."
+                return 0
+              fi
+              echo "  Poll ${i}/20 — waiting 30s..."
+              sleep 30
+            done
+            echo "❌ Timed out. ${hint}"
+            return 1
+          }
+          poll_secret "github-app-id"             "GitHub App registered"    "Did you click 'Create GitHub App'?"
+          # Receiver must stay alive until installation_id is captured — teardown runs after this step.
+          poll_secret "github-app-installation-id" "Installation complete"   "Did GitHub redirect to /install-callback?"
+
+      - name: Tear down Cloud Run receiver
+        if: always() && steps.check-secrets.outputs.exists == 'false'
+        run: |
+          echo "Deleting Cloud Run receiver service..."
+          gcloud run services delete "github-app-bootstrap-receiver" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet 2>/dev/null || true
+          echo "✅ Cloud Run receiver deleted."
+
+  # ─── Phase 5: Trigger first agent deploy ──────────────────────────────────
+  trigger-first-deploy:
+    name: Trigger first agent build (dispatch deploy.yml)
+    runs-on: ubuntu-latest
+    needs: [inject-railway-variables]
+    # Only run when Railway variables were actually injected (not skipped).
+    # Skipped result treated as success so summary still runs.
+    if: inputs.skip_railway != 'true' && inputs.dry_run != 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
+
+    steps:
+      - name: Authenticate to GCP (WIF)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        continue-on-error: true
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: steps.provisioner.outcome == 'success'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Skip first deploy (Provisioner App credentials unavailable)
+        if: steps.provisioner.outcome != 'success'
+        run: |
+          {
+            echo "## ⚠️ Phase 5 — first deploy skipped"
+            echo
+            echo "provisioner-app credentials not found in \`${{ vars.GCP_PROJECT_ID }}\` Secret Manager."
+            echo "Dispatch \`deploy.yml\` manually once Railway is provisioned, or re-run"
+            echo "\`redispatch-bootstrap.yml\` after provisioning with \`provision-new-clone.yml\`"
+            echo "(which copies provisioner-app-id + provisioner-app-private-key to the clone's SM)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Phase 5 skipped — provisioner-app credentials missing from clone's Secret Manager"
+
+      - name: Skip first deploy (App token generation failed)
+        if: steps.provisioner.outcome == 'success' && steps.app-token.outcome != 'success'
+        run: |
+          {
+            echo "## ⚠️ Phase 5 — first deploy skipped"
+            echo
+            echo "provisioner-app credentials were fetched but GitHub App token generation failed."
+            echo "Verify provisioner-app-id and provisioner-app-private-key are valid in \`${{ vars.GCP_PROJECT_ID }}\` SM."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Phase 5 skipped — GitHub App token generation failed"
+
+      - name: Dispatch deploy.yml and poll to completion
+        if: steps.app-token.outcome == 'success'
+        env:
+          GH_TOKEN:  ${{ steps.app-token.outputs.token }}
+          REPO:      ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import datetime, json, os, sys, time, urllib.request, urllib.error
+
+          token        = os.environ["GH_TOKEN"]
+          repo         = os.environ["REPO"]
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+
+          HEADERS = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+          }
+
+          def gh(method, path, body=None):
+            req = urllib.request.Request(
+              f"https://api.github.com{path}",
+              data=json.dumps(body).encode() if body else None,
+              headers=HEADERS, method=method
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+                return r.status, json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+              return e.code, json.loads(e.read().decode("utf-8", "replace"))
+
+          # return_run_details=true (GitHub API 2026-02-19): returns run_id in body.
+          status, resp = gh("POST", f"/repos/{repo}/actions/workflows/deploy.yml/dispatches", {
+            "ref": "main",
+            "return_run_details": True,
+          })
+
+          run_id  = resp.get("id")
+          run_url = resp.get("workflow_url") or f"https://github.com/{repo}/actions"
+
+          if status not in (200, 201, 204) or not run_id:
+            # Fallback: find the run by timestamp
+            dispatch_ts = time.time()
+            run_id = None
+            for delay in [3, 5, 8, 13]:
+              time.sleep(delay)
+              _, runs = gh("GET", f"/repos/{repo}/actions/workflows/deploy.yml/runs?per_page=5&event=workflow_dispatch")
+              for r in (runs.get("workflow_runs") or []):
+                created = datetime.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).timestamp()
+                if created >= dispatch_ts - 5:
+                  run_id = r["id"]; run_url = r["html_url"]; break
+              if run_id: break
+
+          if not run_id:
+            print("::warning::Could not determine deploy.yml run_id — check Actions tab")
+            with open(summary_path, "a") as f:
+              f.write("## ⚠️ Phase 5 — deploy.yml dispatched (run ID unknown)\n\nCheck the Actions tab.\n")
+            sys.exit(0)  # Non-fatal: bootstrap itself succeeded
+
+          print(f"::notice::deploy.yml dispatched — run {run_id}: {run_url}")
+
+          # Poll to completion (max 15 min)
+          deadline = time.time() + 900
+          conclusion = None
+          while time.time() < deadline:
+            _, run = gh("GET", f"/repos/{repo}/actions/runs/{run_id}")
+            conclusion = run.get("conclusion")
+            run_url = run.get("html_url", run_url)
+            if run.get("status") == "completed":
+              break
+            time.sleep(15)
+          else:
+            conclusion = "timed_out"
+
+          icon = "✅" if conclusion == "success" else "❌"
+          with open(summary_path, "a") as f:
+            f.write(f"## {icon} Phase 5 — Agent first deploy: **{conclusion}**\n\nRun: {run_url}\n")
+
+          if conclusion == "success":
+            print(f"::notice::deploy.yml completed successfully — {run_url}")
+          else:
+            print(f"::error::deploy.yml concluded: {conclusion} — {run_url}")
+            sys.exit(1)
+          PYEOF
+
+  # ─── Summary ───────────────────────────────────────────────────────────────
+  summary:
+    name: Bootstrap summary
+    runs-on: ubuntu-latest
+    needs: [generate-and-inject-secrets, terraform-apply, inject-railway-variables, github-app-registration, trigger-first-deploy]
+    if: always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
+
+    steps:
+      - name: Print next steps
+        run: |
+          echo "## Bootstrap Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Next steps" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. Agent service build triggered automatically (deploy.yml dispatched by Phase 5)" >> "$GITHUB_STEP_SUMMARY"
+          echo "2. Set GitHub repository variables from Terraform outputs (see terraform-apply job)" >> "$GITHUB_STEP_SUMMARY"
+          echo "3. Validate n8n: \`curl https://YOUR_N8N_URL/healthz\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "4. Retrieve n8n admin password if needed:" >> "$GITHUB_STEP_SUMMARY"
+          echo "   GCP Secret Manager → \`n8n-admin-password-plaintext\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Remaining human-only steps (if not done)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Telegram bot: 1 tap in Managed Bots dialog (Telegram anti-abuse vendor floor)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- GitHub App: 2 clicks via the receiver URL printed in Phase 4 (github-app-registration job)" >> "$GITHUB_STEP_SUMMARY"
+          echo "  The receiver auto-captures installation_id — no APP_INSTALLATION_ID paste needed." >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "${{ vars.APP_NAME }}" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ⚠ Phase 4 SKIPPED — APP_NAME repo variable is not set" >> "$GITHUB_STEP_SUMMARY"
+            echo "GitHub App was NOT registered. Set APP_NAME on this repo and re-run bootstrap." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Phase 4 (GitHub App registration) was skipped — APP_NAME repo variable is not set. Set APP_NAME and re-run bootstrap."
+          fi

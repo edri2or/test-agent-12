@@ -1,0 +1,41 @@
+{
+  "name": "autonomous-agent-template",
+  "version": "0.1.0",
+  "description": "Secure autonomous software orchestration platform template",
+  "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "build:check": "tsc --noEmit --incremental --tsBuildInfoFile .tsbuildinfo",
+    "build:js": "tsc",
+    "dev": "node --loader ts-node/esm src/agent/index.ts",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:docs": "jest src/agent/tests/",
+    "deploy": "railway up",
+    "validate": "./tools/validate.sh",
+    "bootstrap": "./tools/bootstrap.sh"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.19.39",
+    "ajv": "^8.20.0",
+    "jest": "^29.7.0",
+    "js-yaml": "^4.1.1",
+    "ts-jest": "^29.1.5",
+    "typescript": "^5.4.5"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/tests/**/*.test.ts"
+    ],
+    "collectCoverageFrom": [
+      "src/**/*.ts"
+    ]
+  }
+}

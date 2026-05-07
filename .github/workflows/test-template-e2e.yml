@@ -1,0 +1,229 @@
+name: Template E2E test suite
+
+# Comprehensive validation of the template provisioning pipeline.
+#
+# Tier 1 (always, no WIF): schema + Jest tests + spec invariants.
+# Tier 2 (dispatch only, with WIF): Railway probe + GCP secret inventory.
+#
+# Triggers:
+#   workflow_dispatch — manual on-demand run (full Tier 1 + Tier 2)
+#   schedule          — weekly Saturday 02:00 UTC (Tier 1 + Tier 2)
+#   pull_request      — on changes to specs/, schemas/, or this file (Tier 1 only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec_path:
+        description: "Spec to probe (e.g. specs/template-testing-system.yaml). Leave blank for full suite."
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 2 * * 6"
+  pull_request:
+    paths:
+      - "specs/**"
+      - "schemas/system-spec.v1.json"
+      - "src/agent/tests/**"
+      - ".github/workflows/test-template-e2e.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ── Tier 1: static validation (no cloud access needed) ──────────────────────
+  static-validation:
+    name: Static validation (schema + Jest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --silent
+
+      - name: TypeScript type check
+        run: npm run build
+
+      - name: Run full Jest suite
+        run: npm test -- --ci --reporters=default
+        env:
+          CI: "true"
+
+      - name: Summarise Jest results
+        if: always()
+        run: |
+          {
+            echo "## Static validation"
+            echo ""
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "✅ All Jest tests passed (schema validation + provisioning invariants + router)."
+            else
+              echo "❌ One or more Jest tests failed. See logs above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Tier 2: live probe (WIF required) ────────────────────────────────────────
+  live-probe:
+    name: Live probe (Railway + GCP)
+    needs: static-validation
+    # Skip on PRs — no WIF secret available in fork-PR contexts.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      SPEC_PATH: ${{ inputs.spec_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --silent
+
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Railway API token from Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            railway-api-token:${{ vars.GCP_PROJECT_ID }}/railway-api-token
+
+      - name: Probe Railway state
+        id: railway
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+          SPEC_PATH: ${{ inputs.spec_path }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request
+
+          token     = os.environ["RAILWAY_TOKEN"]
+          spec_path = os.environ.get("SPEC_PATH", "").strip()
+          GRAPHQL   = "https://backboard.railway.app/graphql/v2"
+          HEADERS   = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+            "User-Agent":    "autonomous-agent-template-builder/1.0 (+test-template-e2e.yml)",
+          }
+
+          def gql(query):
+            req = urllib.request.Request(GRAPHQL,
+              data=json.dumps({"query": query}).encode(),
+              headers=HEADERS, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as r:
+              return json.loads(r.read())
+
+          PROJ_FRAG = "id name createdAt services { edges { node { name } } }"
+          body = gql("""query { me {
+            projects { edges { node { %s } } }
+            workspaces { id name projects { edges { node { %s } } } }
+          } }""" % (PROJ_FRAG, PROJ_FRAG))
+
+          me = (body.get("data") or {}).get("me") or {}
+          all_projects = {}
+          for edge in (me.get("projects") or {}).get("edges") or []:
+            p = edge["node"]; all_projects[p["id"]] = p
+          for ws in me.get("workspaces") or []:
+            for edge in (ws.get("projects") or {}).get("edges") or []:
+              p = edge["node"]; all_projects[p["id"]] = p
+          projects = list(all_projects.values())
+
+          # If a specific spec was given, look for its project.
+          target_name = None
+          if spec_path:
+            import re, pathlib
+            raw = pathlib.Path(spec_path).read_text()
+            m = re.search(r"^\s*name:\s*(\S+)", raw, re.M)
+            if m:
+              target_name = m.group(1)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          with open(summary, "a") as f:
+            f.write("## Railway probe\n\n")
+            f.write(f"**Total projects visible:** {len(projects)}\n\n")
+            if target_name:
+              match = next((p for p in projects if p.get("name") == target_name), None)
+              if match:
+                svcs = [e["node"]["name"] for e in (match.get("services") or {}).get("edges") or []]
+                f.write(f"**Target spec `{target_name}`:** ✅ found — services: {', '.join(svcs) or '(none)'}\n\n")
+              else:
+                f.write(f"**Target spec `{target_name}`:** ⚠️ project not yet provisioned\n\n")
+            f.write("| Project | Services |\n|---------|----------|\n")
+            for p in sorted(projects, key=lambda x: x.get("name", "")):
+              svcs = [e["node"]["name"] for e in (p.get("services") or {}).get("edges") or []]
+              f.write(f"| `{p['name']}` | {', '.join(svcs) or '—'} |\n")
+          PYEOF
+
+      - name: Probe GCP Secret Manager — required secrets present
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          REQUIRED=(
+            cloudflare-api-token
+            cloudflare-account-id
+            linear-api-key
+            linear-webhook-secret
+            n8n-admin-password-hash
+            n8n-encryption-key
+            openrouter-management-key
+            openrouter-runtime-key
+            railway-api-token
+            telegram-bot-token
+            provisioner-app-id
+            provisioner-app-private-key
+            provisioner-app-installation-id
+          )
+
+          PRESENT=()
+          MISSING=()
+          for secret in "${REQUIRED[@]}"; do
+            if gcloud secrets describe "$secret" --project="$GCP_PROJECT" \
+                --format="value(name)" >/dev/null 2>&1; then
+              PRESENT+=("$secret")
+            else
+              MISSING+=("$secret")
+            fi
+          done
+
+          {
+            echo "## GCP Secret Manager probe"
+            echo ""
+            echo "**Project:** \`$GCP_PROJECT\`"
+            echo ""
+            echo "| Secret | Status |"
+            echo "|--------|--------|"
+            for s in "${PRESENT[@]}"; do echo "| \`$s\` | ✅ present |"; done
+            for s in "${MISSING[@]}"; do echo "| \`$s\` | ❌ missing |"; done
+            echo ""
+            echo "**${#PRESENT[@]} / $((${#PRESENT[@]} + ${#MISSING[@]})) required secrets present.**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            echo "::error::Missing required secrets: ${MISSING[*]}"
+            exit 1
+          fi
+
+      - name: Health summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "---"
+            echo "**Run:** \`${{ github.run_id }}\` | **Triggered by:** \`${{ github.event_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

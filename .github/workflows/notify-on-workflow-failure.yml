@@ -1,0 +1,167 @@
+name: Notify on workflow failure
+
+# Listens to all main-branch workflows and sends a Telegram message +
+# repository_dispatch on failure. Workflow names are exact `name:` values
+# verified from each .yml file — workflow_run does not support wildcards.
+
+on:
+  workflow_run:
+    workflows:
+      - "Bootstrap (dispatch)"
+      - "Deploy"
+      - "Terraform Plan"
+      - "Apply Railway provision"
+      - "Apply Railway spec (ADR-0013)"
+      - "Apply Cloudflare spec (ADR-0013)"
+      - "Apply system spec (ADR-0013)"
+      - "Documentation Enforcement"
+      - "Doc Lint"
+      - "PR Discipline"
+      - "Redispatch bootstrap in clone"
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  notify:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required for repository_dispatch POST
+      id-token: write   # required for WIF token exchange
+
+    steps:
+      - name: Authenticate to GCP (WIF)
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        continue-on-error: true
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        if: vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Send Telegram notification and repository_dispatch
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          WORKFLOW_NAME:  ${{ github.event.workflow_run.name }}
+          RUN_URL:        ${{ github.event.workflow_run.html_url }}
+          HEAD_SHA:       ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN:       ${{ github.token }}
+          REPO:           ${{ github.repository }}
+          WIF_CONFIGURED: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, urllib.request, urllib.error
+
+          project_id     = os.environ.get("GCP_PROJECT_ID", "")
+          workflow       = os.environ.get("WORKFLOW_NAME", "unknown")
+          run_url        = os.environ.get("RUN_URL", "")
+          head_sha       = os.environ.get("HEAD_SHA", "")
+          gh_token       = os.environ.get("GH_TOKEN", "")
+          repo           = os.environ.get("REPO", "")
+          wif_configured = os.environ.get("WIF_CONFIGURED", "false") == "true"
+          summary_path   = os.environ["GITHUB_STEP_SUMMARY"]
+
+          short_sha = head_sha[:7] if head_sha else "unknown"
+          summary   = [
+              "# Workflow failure notification",
+              "",
+              "| Field | Value |",
+              "|-------|-------|",
+              f"| Workflow | `{workflow}` |",
+              f"| Run | {run_url} |",
+              f"| Commit | `{short_sha}` |",
+              "",
+          ]
+
+          def http_post(label, url, payload, extra_headers):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json", **extra_headers},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      print(f"::notice::{label} (HTTP {resp.status})")
+                      summary.append(f"- ✅ {label}")
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", "replace")[:500]
+                  print(f"::warning::{label} HTTP {e.code}: {body}")
+                  summary.append(f"- ⚠ {label} failed: HTTP {e.code}")
+              except Exception as e:
+                  print(f"::warning::{label} error: {e}")
+                  summary.append(f"- ⚠ {label} error: {e}")
+
+          def fetch_secret(name, project):
+              try:
+                  result = subprocess.run(
+                      ["gcloud", "secrets", "versions", "access", "latest",
+                       f"--secret={name}",
+                       f"--project={project}"],
+                      capture_output=True, text=True, timeout=30
+                  )
+                  if result.returncode == 0:
+                      return result.stdout.strip()
+                  print(f"::warning::gcloud fetch {name} failed: {result.stderr[:300]}")
+              except Exception as e:
+                  print(f"::warning::Could not fetch {name}: {e}")
+              return ""
+
+          def skip_telegram(reason):
+              print(f"::warning::Skipping Telegram notification — {reason}")
+              summary.append(f"- ⚠ Telegram notification skipped ({reason})")
+
+          if not (wif_configured and project_id):
+              skip_telegram("WIF not configured")
+          else:
+              bot_token = fetch_secret("telegram-bot-token", project_id)
+              chat_id   = fetch_secret("TELEGRAM_CHAT_ID", project_id)
+              if not bot_token:
+                  skip_telegram("telegram-bot-token fetch failed")
+              elif not chat_id:
+                  skip_telegram("TELEGRAM_CHAT_ID fetch failed")
+              else:
+                  http_post(
+                      f"Telegram notification sent to chat `{chat_id}`",
+                      f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                      {"chat_id": chat_id, "text": (
+                          "❌ Workflow failed on main\n\n"
+                          f"Workflow: {workflow}\n"
+                          f"Run: {run_url}\n"
+                          f"Commit: {short_sha}\n"
+                          f"Branch: main"
+                      )},
+                      {},
+                  )
+
+          if gh_token and repo:
+              http_post(
+                  "`repository_dispatch` event `workflow-run-failed`",
+                  f"https://api.github.com/repos/{repo}/dispatches",
+                  {
+                      "event_type": "workflow-run-failed",
+                      "client_payload": {
+                          "workflow_name": workflow,
+                          "run_url":       run_url,
+                          "head_sha":      head_sha,
+                          "conclusion":    "failure",
+                      },
+                  },
+                  {
+                      "Authorization":        f"Bearer {gh_token}",
+                      "Accept":               "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+
+          with open(summary_path, "a") as f:
+              f.write("\n".join(summary) + "\n")
+          PYEOF

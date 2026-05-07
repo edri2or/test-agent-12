@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-12
+  description: "Test agent 12 — new test system provisioned via operator request 2026-05-07"
+spec:
+  gcp:
+    projectId: or-test-agent-12
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-12
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-12.or-infra.com
+    worker:
+      name: test-agent-12-edge
+      route: test-agent-12.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "צור מערכת טסט חדשה — create new test system, operator request 2026-05-07"

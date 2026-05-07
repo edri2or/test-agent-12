@@ -1,0 +1,109 @@
+{
+  "name": "Linear Webhook → Issue Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "linear-issue",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Linear Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "linear-issue"
+    },
+    {
+      "parameters": {
+        "jsCode": "// R-02: fail-closed — Linear uses HMAC-SHA256, not a simple token\nconst crypto = require('crypto');\nconst secret = $env['LINEAR_WEBHOOK_SECRET'] ?? '';\nconst sig = $input.first().headers['linear-signature'] ?? '';\nif (!secret || !sig) throw new Error('Missing Linear webhook signature — dropping (R-02)');\n\nconst body = JSON.stringify($input.first().json);\nconst expected = crypto.createHmac('sha256', secret).update(body).digest('hex');\nif (sig !== expected) throw new Error('Invalid Linear webhook signature — dropping (R-02)');\n\nconst payload = $input.first().json;\nconst action = payload.action;\nconst issueData = payload.data ?? {};\n\nreturn [{\n  json: {\n    action,\n    issue_id: issueData.id,\n    issue_identifier: issueData.identifier,\n    title: issueData.title,\n    state: issueData.state?.name,\n    assignee: issueData.assignee?.name,\n    url: issueData.url,\n    team: issueData.team?.name,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "validate-and-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 460]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.action }}",
+              "operation": "equals",
+              "value2": "update"
+            }
+          ]
+        }
+      },
+      "id": "check-action",
+      "name": "Is Update?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $env['TELEGRAM_CHAT_ID'] }}" },
+            {
+              "name": "text",
+              "value": "=<b>Linear issue updated</b>\n{{ $json.issue_identifier }}: {{ $json.title }}\nState: {{ $json.state }}\n{{ $json.url }}"
+            },
+            { "name": "parse_mode", "value": "HTML" },
+            { "name": "disable_web_page_preview", "value": "true" }
+          ]
+        }
+      },
+      "id": "notify-telegram",
+      "name": "Notify via Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Linear Webhook": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[
+        { "node": "Respond 200 OK", "type": "main", "index": 0 },
+        { "node": "Is Update?", "type": "main", "index": 0 }
+      ]]
+    },
+    "Is Update?": {
+      "main": [
+        [{ "node": "Notify via Telegram", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Import via n8n UI: Workflows → Import from file. Configure Linear webhook URL to point to this n8n endpoint. Set env vars LINEAR_WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID before activating."
+}

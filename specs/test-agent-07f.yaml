@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-07f
+  description: "Test agent 07f — prove bootstrap Phase 3 Railway inject after Issue 9 fix"
+spec:
+  gcp:
+    projectId: or-test-agent-07f
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-07f
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-07f.or-infra.com
+    worker:
+      name: test-agent-07f-edge
+      route: test-agent-07f.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "prove bootstrap Phase 3 Railway variable inject after Issue 9 fix"

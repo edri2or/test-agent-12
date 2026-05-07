@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: my-agent-test-5-5
+  description: "Agent system created 2026-05-05 — exercises full provisioning pipeline from spec"
+spec:
+  gcp:
+    projectId: or-my-agent-test-5-5
+    region: us-central1
+  github:
+    repo: edri2or/my-agent-test-5-5
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: my-agent-test-5-5.or-infra.com
+    worker:
+      name: my-agent-test-5-5-edge
+      route: my-agent-test-5-5.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "operator-requested fresh clone — created 2026-05-05"

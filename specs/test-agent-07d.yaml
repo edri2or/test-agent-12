@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-07d
+  description: "Test agent 07d — full DAG proof after all 9 friction-point fixes (PRs #113-#124)"
+spec:
+  gcp:
+    projectId: or-test-agent-07d
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-07d
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-07d.or-infra.com
+    worker:
+      name: test-agent-07d-edge
+      route: test-agent-07d.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "prove full DAG first-attempt success: provision-clone + provision-providers + activate-clone (Issue 8 fix: repository_dispatch)"

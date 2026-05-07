@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-01
+  description: "Test agent — full provision from template"
+spec:
+  gcp:
+    projectId: or-test-agent-01
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-01
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-01.or-infra.com
+    worker:
+      name: test-agent-01-edge
+      route: test-agent-01.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "test agent — full autonomous provision flow"

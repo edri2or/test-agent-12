@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-11
+  description: "Test agent 11 — clean first-attempt proof with all fixes (Issues 1–13); fresh GCP project ID (or-test-agent-10 in 30-day DELETE_REQUESTED hold after cleanup)"
+spec:
+  gcp:
+    projectId: or-test-agent-11
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-11
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-11.or-infra.com
+    worker:
+      name: test-agent-11-edge
+      route: test-agent-11.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "clean first-attempt proof with all 13 friction fixes; or-test-agent-10 in DELETE_REQUESTED hold, using or-test-agent-11"

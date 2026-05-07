@@ -1,0 +1,286 @@
+name: Check N8N Version + Crypto API (one-time probe)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  probe:
+    name: Probe N8N runtime crypto capabilities
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      N8N_OWNER_EMAIL: ${{ vars.N8N_OWNER_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch secrets from GCP Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            railway-api-token:${{ vars.GCP_PROJECT_ID }}/railway-api-token
+            n8n-admin-password-plaintext:${{ vars.GCP_PROJECT_ID }}/n8n-admin-password-plaintext
+            railway-project-id:${{ vars.GCP_PROJECT_ID }}/railway-project-id
+            railway-environment-id:${{ vars.GCP_PROJECT_ID }}/railway-environment-id
+      - name: Export Railway project/environment IDs to env
+        run: |
+          echo "RAILWAY_PROJECT_ID=${{ steps.secrets.outputs.railway-project-id }}" >> "$GITHUB_ENV"
+          echo "RAILWAY_ENVIRONMENT_ID=${{ steps.secrets.outputs.railway-environment-id }}" >> "$GITHUB_ENV"
+
+
+      - name: Resolve N8N Railway service domain
+        id: domain
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+        run: |
+          RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){services{edges{node{id name}}}}}","variables":{"pid":$pid}}')")
+
+          N8N_SVC_ID=$(echo "$RESP" | jq -r \
+            '[.data.project.services.edges[] | select(.node.name == "n8n")] | first | .node.id // empty')
+          [ -n "$N8N_SVC_ID" ] || { echo "::error::N8N service not found in Railway project"; exit 1; }
+
+          DOMAINS_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg sid "$N8N_SVC_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+              '{"query":"query($sid:String!,$eid:String!){serviceInstance(serviceId:$sid,environmentId:$eid){domains{serviceDomains{id domain}}}}","variables":{"sid":$sid,"eid":$eid}}')")
+
+          N8N_DOMAIN=$(echo "$DOMAINS_RESP" | jq -r \
+            '(.data.serviceInstance.domains.serviceDomains // []) | .[0].domain // empty')
+          [ -n "$N8N_DOMAIN" ] || { echo "::error::N8N Railway service domain not found"; exit 1; }
+
+          echo "N8N domain: $N8N_DOMAIN"
+          echo "n8n_domain=$N8N_DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for N8N to be healthy
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          CHECK_URL="https://$N8N_DOMAIN/healthz/readiness"
+          for attempt in $(seq 1 10); do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$CHECK_URL" 2>/dev/null)
+            echo "Attempt $attempt/10: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && { echo "N8N is healthy."; break; }
+            [ "$attempt" = "10" ] && { echo "::error::N8N health check failed after 10 attempts"; exit 1; }
+            sleep 15
+          done
+
+      - name: Login to N8N + get version
+        id: n8n_auth
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          N8N_OWNER_PASSWORD: ${{ steps.secrets.outputs.n8n-admin-password-plaintext }}
+        run: |
+          BASE_URL="https://$N8N_DOMAIN"
+
+          LOGIN_RESP=$(curl -s -c /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/login" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn \
+              --arg email "$N8N_OWNER_EMAIL" \
+              --arg pw "$N8N_OWNER_PASSWORD" \
+              '{"emailOrLdapLoginId":$email,"password":$pw}')")
+
+          USER_ID=$(echo "$LOGIN_RESP" | jq -r '.data.id // empty')
+          [ -n "$USER_ID" ] || { echo "::error::N8N login failed: $(echo "$LOGIN_RESP" | jq -r '.code // .message // .')"; exit 1; }
+          echo "Logged in as user $USER_ID"
+
+          SETTINGS=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/settings")
+          N8N_VERSION=$(echo "$SETTINGS" | jq -r '.data.versionCli // .versionCli // "unknown"')
+          echo "N8N version: $N8N_VERSION"
+
+          EXPIRES=$(( $(date +%s) * 1000 + 3600000 ))
+          APIKEY_RESP=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/api-keys" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --argjson exp "$EXPIRES" \
+              '{"label":"crypto-probe-ci","scopes":["workflow:create","workflow:list","workflow:update","workflow:delete"],"expiresAt":$exp}')")
+
+          N8N_API_KEY=$(echo "$APIKEY_RESP" | jq -r '.data.rawApiKey // empty')
+          N8N_API_KEY_ID=$(echo "$APIKEY_RESP" | jq -r '.data.id // empty')
+          [ -n "$N8N_API_KEY" ] || { echo "::error::Failed to create N8N API key: $APIKEY_RESP"; exit 1; }
+
+          echo "::add-mask::$N8N_API_KEY"
+          echo "n8n_api_key=$N8N_API_KEY" >> "$GITHUB_OUTPUT"
+          echo "n8n_api_key_id=$N8N_API_KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
+          echo "n8n_version=$N8N_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Delete any stale probe workflow
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+        run: |
+          WORKFLOWS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/workflows?limit=100")
+          STALE_ID=$(echo "$WORKFLOWS" | jq -r \
+            '[(.data // [])[] | select(.name == "__crypto_probe_tmp__")] | first | .id // empty')
+          if [ -n "$STALE_ID" ]; then
+            curl -s -b /tmp/n8n_cookies.txt -X POST "$BASE_URL/rest/workflows/$STALE_ID/deactivate" > /dev/null
+            curl -s -b /tmp/n8n_cookies.txt -X DELETE "$BASE_URL/rest/workflows/$STALE_ID" > /dev/null
+            echo "Deleted stale probe workflow: $STALE_ID"
+          else
+            echo "No stale probe workflow found."
+          fi
+
+      - name: Deploy crypto probe workflow
+        id: probe_deploy
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+        run: |
+          WF_JSON=$(jq -cn '{
+            "name": "__crypto_probe_tmp__",
+            "nodes": [
+              {
+                "id": "wh-probe",
+                "name": "Probe Webhook",
+                "type": "n8n-nodes-base.webhook",
+                "typeVersion": 1,
+                "position": [250, 300],
+                "parameters": {
+                  "httpMethod": "GET",
+                  "path": "crypto-probe-tmp",
+                  "responseMode": "responseNode",
+                  "options": {}
+                }
+              },
+              {
+                "id": "code-probe",
+                "name": "Probe Code",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [500, 300],
+                "parameters": {
+                  "jsCode": "const r = {\n  crypto_type: typeof globalThis?.crypto,\n  crypto_subtle_type: typeof globalThis?.crypto?.subtle,\n  crypto_getRandomValues_type: typeof globalThis?.crypto?.getRandomValues,\n  has_require_crypto: false,\n  require_crypto_error: null\n};\ntry { require(\"crypto\"); r.has_require_crypto = true; } catch(e) { r.require_crypto_error = e.message; }\nreturn [{json: r}];"
+                }
+              },
+              {
+                "id": "resp-probe",
+                "name": "Probe Respond",
+                "type": "n8n-nodes-base.respondToWebhook",
+                "typeVersion": 1,
+                "position": [750, 300],
+                "parameters": {
+                  "respondWith": "firstIncomingItem"
+                }
+              }
+            ],
+            "connections": {
+              "Probe Webhook":  {"main": [[{"node": "Probe Code",    "type": "main", "index": 0}]]},
+              "Probe Code":     {"main": [[{"node": "Probe Respond", "type": "main", "index": 0}]]}
+            },
+            "settings": {"executionOrder": "v1"}
+          }')
+
+          CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+            -X POST "$BASE_URL/api/v1/workflows" \
+            -H "Content-Type: application/json" \
+            -d "$WF_JSON")
+          WF_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+          [ -n "$WF_ID" ] || { echo "::error::Probe workflow creation failed: $CREATE"; exit 1; }
+          echo "Created probe workflow: $WF_ID"
+          echo "probe_wf_id=$WF_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Activate probe workflow
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          WF_ID: ${{ steps.probe_deploy.outputs.probe_wf_id }}
+        run: |
+          WF_RESP=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/workflows/$WF_ID")
+          VERSION_ID=$(echo "$WF_RESP" | jq -r '.data.versionId // empty')
+          [ -n "$VERSION_ID" ] || { echo "::error::versionId missing: $WF_RESP"; exit 1; }
+
+          ACTIVATE=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/workflows/$WF_ID/activate" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg vid "$VERSION_ID" '{"versionId":$vid}')")
+          ACTIVATED=$(echo "$ACTIVATE" | jq -r '.data.active // "false"')
+          [ "$ACTIVATED" = "true" ] || { echo "::error::Activation failed: $ACTIVATE"; exit 1; }
+          echo "Probe workflow activated."
+          sleep 2
+
+      - name: Trigger probe + capture result
+        id: probe_result
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          RESP=$(curl -s --max-time 20 "https://$N8N_DOMAIN/webhook/crypto-probe-tmp")
+          echo "Raw probe response: $RESP"
+
+          CRYPTO_TYPE=$(echo "$RESP"         | jq -r '.crypto_type // "error"')
+          CRYPTO_SUBTLE=$(echo "$RESP"       | jq -r '.crypto_subtle_type // "error"')
+          CRYPTO_GRV=$(echo "$RESP"          | jq -r '.crypto_getRandomValues_type // "error"')
+          HAS_REQUIRE=$(echo "$RESP"         | jq -r '.has_require_crypto // "false"')
+          REQUIRE_ERR=$(echo "$RESP"         | jq -r '.require_crypto_error // ""')
+
+          echo "globalThis.crypto type:              $CRYPTO_TYPE"
+          echo "globalThis.crypto.subtle type:       $CRYPTO_SUBTLE"
+          echo "globalThis.crypto.getRandomValues:   $CRYPTO_GRV"
+          echo "require('crypto') available:         $HAS_REQUIRE"
+          [ -n "$REQUIRE_ERR" ] && echo "require('crypto') error: $REQUIRE_ERR"
+
+          echo "crypto_subtle=$CRYPTO_SUBTLE" >> "$GITHUB_OUTPUT"
+          echo "crypto_grv=$CRYPTO_GRV"       >> "$GITHUB_OUTPUT"
+          echo "has_require=$HAS_REQUIRE"     >> "$GITHUB_OUTPUT"
+
+          if [ "$CRYPTO_SUBTLE" = "function" ]; then
+            echo "JWT_PATH=A" >> "$GITHUB_OUTPUT"
+            echo "PATH=A — globalThis.crypto.subtle is available. Pure WebCrypto RS256 confirmed."
+          else
+            echo "JWT_PATH=B" >> "$GITHUB_OUTPUT"
+            echo "PATH=B — globalThis.crypto.subtle NOT available. NODE_FUNCTION_ALLOW_BUILTIN=crypto required."
+          fi
+
+      - name: Cleanup — deactivate + delete probe workflow + revoke API key
+        if: always()
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          WF_ID: ${{ steps.probe_deploy.outputs.probe_wf_id }}
+          KEY_ID: ${{ steps.n8n_auth.outputs.n8n_api_key_id }}
+        run: |
+          if [ -n "$WF_ID" ]; then
+            curl -s -b /tmp/n8n_cookies.txt -X POST "$BASE_URL/rest/workflows/$WF_ID/deactivate" > /dev/null
+            curl -s -b /tmp/n8n_cookies.txt -X DELETE "$BASE_URL/rest/workflows/$WF_ID" > /dev/null
+            echo "Probe workflow $WF_ID deleted."
+          fi
+          if [ -n "$KEY_ID" ]; then
+            curl -s -b /tmp/n8n_cookies.txt -X DELETE "$BASE_URL/rest/api-keys/$KEY_ID" > /dev/null
+            echo "CI API key $KEY_ID revoked."
+          fi
+
+      - name: Summary
+        env:
+          N8N_VERSION: ${{ steps.n8n_auth.outputs.n8n_version }}
+          CRYPTO_SUBTLE: ${{ steps.probe_result.outputs.crypto_subtle }}
+          CRYPTO_GRV: ${{ steps.probe_result.outputs.crypto_grv }}
+          HAS_REQUIRE: ${{ steps.probe_result.outputs.has_require }}
+          JWT_PATH: ${{ steps.probe_result.outputs.JWT_PATH }}
+        run: |
+          {
+            echo "## N8N Version + Crypto Probe Results"
+            echo ""
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| N8N version | \`$N8N_VERSION\` |"
+            echo "| \`typeof globalThis?.crypto?.subtle\` | \`$CRYPTO_SUBTLE\` |"
+            echo "| \`typeof globalThis?.crypto?.getRandomValues\` | \`$CRYPTO_GRV\` |"
+            echo "| \`require('crypto')\` available | \`$HAS_REQUIRE\` |"
+            echo "| **JWT implementation path** | **Path $JWT_PATH** |"
+          } >> "$GITHUB_STEP_SUMMARY"

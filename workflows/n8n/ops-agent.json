@@ -1,0 +1,148 @@
+{
+  "name": "ops-agent",
+  "nodes": [
+    {
+      "id": "webhook-ops",
+      "name": "ops-agent Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ops-agent",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-context",
+      "name": "Extract Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst text = (body.text || '').toString();\nconst chatId = String(body.chat_id || '');\nconst isTest = chatId === 'test' || chatId.startsWith('test-');\nreturn [{ json: { text, chat_id: chatId, is_test: isTest } }];"
+      }
+    },
+    {
+      "id": "http-health",
+      "name": "N8N Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [750, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "https://@@N8N_DOMAIN@@/healthz/readiness",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "http-state",
+      "name": "Fetch State",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1000, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "@@GITHUB_PAGES_STATE_URL@@",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 5000
+        }
+      }
+    },
+    {
+      "id": "code-build-reply",
+      "name": "Build Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "parameters": {
+        "jsCode": "const ctx = $('Extract Context').first().json;\nconst healthResp = $('N8N Health').first().json || {};\nconst stateResp = $input.first().json;\nconst status = healthResp.statusCode || healthResp.status || 0;\nconst healthy = status >= 200 && status < 300;\nconst lines = [];\nlines.push(healthy ? '\\u2705 N8N \\u05d1\\u05e8\\u05d9\\u05d0 (healthz 200)' : '\\u26a0\\ufe0f N8N \\u05dc\\u05d0 \\u05de\\u05d2\\u05d9\\u05d1 (' + status + ')');\nlet state = null;\ntry {\n  state = (stateResp && typeof stateResp === 'object') ? stateResp : JSON.parse(String(stateResp));\n} catch (e) {}\nconst stages = (state && Array.isArray(state.build_stages)) ? state.build_stages : null;\nif (stages && stages.length > 0) {\n  const VERB = { completed: '\\u05d4\\u05d5\\u05e9\\u05dc\\u05dd', in_progress: '\\u05d1\\u05e2\\u05d1\\u05d5\\u05d3\\u05d4', pending: '\\u05de\\u05de\\u05ea\\u05d9\\u05df' };\n  const current = stages.find(s => s.status === 'in_progress')\n    || stages.find(s => s.status === 'pending')\n    || [...stages].reverse().find(s => s.status === 'completed');\n  lines.push('\\u05e9\\u05dc\\u05d1 ' + current.number + ': ' + current.name + ' \\u2014 ' + (VERB[current.status] || VERB.pending));\n  const prs = Array.isArray(state.open_prs) ? state.open_prs : [];\n  lines.push('PRs \\u05e4\\u05ea\\u05d5\\u05d7\\u05d9\\u05dd: ' + prs.length);\n} else {\n  lines.push('\\u26a0\\ufe0f \\u05dc\\u05d0 \\u05e0\\u05d9\\u05ea\\u05df \\u05dc\\u05e7\\u05e8\\u05d5\\u05d0 state.json');\n}\nconst reply = lines.join('\\n');\nreturn [{ json: { chat_id: ctx.chat_id, reply_text: reply, is_test: ctx.is_test } }];"
+      }
+    },
+    {
+      "id": "if-test",
+      "name": "Is Test?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1500, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{ $json.is_test }}", "value2": true }
+          ]
+        }
+      }
+    },
+    {
+      "id": "telegram-send",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1750, 400],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply_text }}"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "@@CRED_TELEGRAM_ID@@",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2000, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, agent: 'ops', reply: $json.reply_text }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "ops-agent Webhook": {
+      "main": [[{ "node": "Extract Context", "type": "main", "index": 0 }]]
+    },
+    "Extract Context": {
+      "main": [[{ "node": "N8N Health", "type": "main", "index": 0 }]]
+    },
+    "N8N Health": {
+      "main": [[{ "node": "Fetch State", "type": "main", "index": 0 }]]
+    },
+    "Fetch State": {
+      "main": [[{ "node": "Build Reply", "type": "main", "index": 0 }]]
+    },
+    "Build Reply": {
+      "main": [[{ "node": "Is Test?", "type": "main", "index": 0 }]]
+    },
+    "Is Test?": {
+      "main": [
+        [{ "node": "Respond", "type": "main", "index": 0 }],
+        [{ "node": "Send Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Reply": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

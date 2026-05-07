@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-07e
+  description: "Test agent 07e — full DAG proof after Issue 8 gh-api flag fix (PR #125)"
+spec:
+  gcp:
+    projectId: or-test-agent-07e
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-07e
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-07e.or-infra.com
+    worker:
+      name: test-agent-07e-edge
+      route: test-agent-07e.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "prove full DAG first-attempt success including activate-clone (repository_dispatch, gh api exit-code fix)"

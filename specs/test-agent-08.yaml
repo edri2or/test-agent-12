@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-08
+  description: "Test agent 08 — clean first-attempt proof: full DAG + Phase 4 GitHub App via automatic WEBHOOK_URL (Issues 10+11 fixes)"
+spec:
+  gcp:
+    projectId: or-test-agent-08
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-08
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-08.or-infra.com
+    worker:
+      name: test-agent-08-edge
+      route: test-agent-08.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "clean first-attempt proof of full provision DAG including Phase 4 GitHub App registration with automatic WEBHOOK_URL"

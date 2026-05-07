@@ -1,0 +1,195 @@
+{
+  "name": "Agent Router",
+  "nodes": [
+    {
+      "id": "webhook-router",
+      "name": "Router Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "agent-router",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-sanitise",
+      "name": "Sanitise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nlet text = (body.text || '').toString();\ntext = text.replace(/`/g, \"'\");\ntext = text.replace(/<\\|[^|]*\\|>/g, '');\ntext = text.replace(/<\\/?(system|assistant|user|human|bot)[^>]*>/gi, '');\ntext = text.replace(/\\b(ignore previous|disregard previous|disregard|sudo)\\b/gi, '');\nconst allowHosts = ['or-infra.com', 'telegram.org', 'github.com'];\ntext = text.replace(/https?:\\/\\/\\S+/gi, (u) => {\n  try {\n    const host = new URL(u).hostname.toLowerCase();\n    const ok = allowHosts.some((h) => host === h || host.endsWith('.' + h));\n    return ok ? u : '[url]';\n  } catch (e) { return '[url]'; }\n});\ntext = text.slice(0, 500);\nconst chatId = String(body.chat_id || '');\nconst isTest = chatId === 'test' || chatId.startsWith('test-') || body._test === true;\nreturn [{ json: { text, chat_id: chatId, is_test: isTest } }];"
+      }
+    },
+    {
+      "id": "http-classify",
+      "name": "Classify (OpenRouter)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [750, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'openai/gpt-4o-mini', messages: [{ role: 'system', content: 'You classify Hebrew operator intents. Output ONLY {\"intent\": X, \"confidence\": Y}. Y float 0-1, >= 0.7 when confident. Rule: classify by the query VERB, not by mentioned service names — a probe asking HOW a service is doing routes ops even if it names N8N/Railway; a probe asking to SEARCH ABOUT a service routes research. Intents: ops (state/health verbs: מצב, איך, עובד, תקין, בריא — e.g. האם השרת בריא?), code (GitHub/PRs/issues/review — e.g. תראה commits של אתמול), research (search/summarize/explain verbs: חפש, תסכם, תסביר — e.g. חפש מידע על Postgres tuning), infra (restart/stop/start/scale verbs: תפעיל, תעצור, תפעל מחדש — e.g. תתחיל מחדש את ה-worker), unknown (greeting, empty, emoji-only, or unrecognizable input).' }, { role: 'user', content: $json.text }], max_tokens: 50, response_format: { type: 'json_object' } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "@@CRED_OPENROUTER_ID@@",
+          "name": "OpenRouter"
+        }
+      }
+    },
+    {
+      "id": "code-extract-intent",
+      "name": "Extract Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 300],
+      "parameters": {
+        "jsCode": "const ctx = $('Sanitise').first().json;\nconst resp = $input.first().json || {};\nconst content = (resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) || '{}';\nlet intent = 'unknown';\nlet confidence = 0;\ntry {\n  const parsed = JSON.parse(content);\n  if (['ops','code','research','infra','unknown'].includes(parsed.intent)) {\n    intent = parsed.intent;\n  }\n  confidence = Number(parsed.confidence) || 0;\n} catch (e) {}\nif (confidence < 0.6 && intent !== 'unknown') { intent = 'unknown'; }\nconst urlByIntent = {\n  ops: 'https://@@N8N_DOMAIN@@/webhook/ops-agent',\n  code: 'https://@@N8N_DOMAIN@@/webhook/code-agent',\n  research: 'https://@@N8N_DOMAIN@@/webhook/research-agent',\n  infra: 'https://@@N8N_DOMAIN@@/webhook/infra-agent'\n};\nconst dispatchUrl = urlByIntent[intent] || '';\nconst isUnknown = intent === 'unknown';\nconst clarifyReply = '\\u05dc\\u05d0 \\u05d4\\u05d1\\u05e0\\u05ea\\u05d9 \\u05d0\\u05ea \\u05d4\\u05d1\\u05e7\\u05e9\\u05d4. \\u05d1\\u05d7\\u05e8/\\u05d9:\\n1. \\u05e9\\u05d9\\u05e8\\u05d5\\u05ea\\u05d9\\u05dd / \\u05de\\u05e6\\u05d1 \\u2192 ops\\n2. GitHub / PR / \\u05e7\\u05d5\\u05d3 \\u2192 code\\n3. \\u05de\\u05d7\\u05e7\\u05e8 / \\u05d0\\u05d9\\u05e0\\u05d8\\u05e8\\u05e0\\u05d8 \\u2192 research\\n4. \\u05d4\\u05e4\\u05e2\\u05dc\\u05ea / \\u05e2\\u05e6\\u05d9\\u05e8\\u05ea \\u05e9\\u05d9\\u05e8\\u05d5\\u05ea \\u2192 infra';\nreturn [{ json: { text: ctx.text, chat_id: ctx.chat_id, is_test: ctx.is_test, intent, confidence, dispatch_url: dispatchUrl, is_unknown: isUnknown, clarify_reply: clarifyReply } }];"
+      }
+    },
+    {
+      "id": "if-is-test",
+      "name": "Is Test?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{ $json.is_test }}", "value2": true }
+          ]
+        }
+      }
+    },
+    {
+      "id": "if-is-unknown",
+      "name": "Is Unknown?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1500, 400],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{ $json.is_unknown }}", "value2": true }
+          ]
+        }
+      }
+    },
+    {
+      "id": "telegram-clarify",
+      "name": "Telegram Clarify",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1750, 300],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.clarify_reply }}"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "@@CRED_TELEGRAM_ID@@",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "http-dispatch",
+      "name": "Dispatch to Sub-Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1750, 500],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.dispatch_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.text, chat_id: $json.chat_id }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2000, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, intent: $('Extract Intent').first().json.intent, confidence: $('Extract Intent').first().json.confidence }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Router Webhook": {
+      "main": [[{ "node": "Sanitise", "type": "main", "index": 0 }]]
+    },
+    "Sanitise": {
+      "main": [[{ "node": "Classify (OpenRouter)", "type": "main", "index": 0 }]]
+    },
+    "Classify (OpenRouter)": {
+      "main": [[{ "node": "Extract Intent", "type": "main", "index": 0 }]]
+    },
+    "Extract Intent": {
+      "main": [[{ "node": "Is Test?", "type": "main", "index": 0 }]]
+    },
+    "Is Test?": {
+      "main": [
+        [{ "node": "Respond", "type": "main", "index": 0 }],
+        [{ "node": "Is Unknown?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Unknown?": {
+      "main": [
+        [{ "node": "Telegram Clarify", "type": "main", "index": 0 }],
+        [{ "node": "Dispatch to Sub-Agent", "type": "main", "index": 0 }]
+      ]
+    },
+    "Telegram Clarify": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    },
+    "Dispatch to Sub-Agent": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

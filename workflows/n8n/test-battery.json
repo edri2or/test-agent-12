@@ -1,0 +1,12 @@
+[
+  { "text": "מה מצב השירותים?", "expected": "ops" },
+  { "text": "איך N8N?", "expected": "ops" },
+  { "text": "תבדוק PR אחרון", "expected": "code" },
+  { "text": "איזה issues פתוחים?", "expected": "code" },
+  { "text": "מה החדשות ב-AI?", "expected": "research" },
+  { "text": "חפש לי על Railway", "expected": "research" },
+  { "text": "תפעיל את השרת מחדש", "expected": "infra" },
+  { "text": "תעצור את השירות", "expected": "infra" },
+  { "text": "שלום מה שלומך", "expected": "unknown" },
+  { "text": "🎉", "expected": "unknown" }
+]

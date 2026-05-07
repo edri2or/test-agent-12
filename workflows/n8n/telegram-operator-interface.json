@@ -1,0 +1,203 @@
+{
+  "name": "Telegram Operator Interface",
+  "nodes": [
+    {
+      "id": "webhook-tg",
+      "name": "Telegram Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "telegram",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "if-callback-query",
+      "name": "Is Callback Query?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [500, 300],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.body?.callback_query?.id }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "code-extract-cb",
+      "name": "Extract Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [750, 150],
+      "parameters": {
+        "jsCode": "const body=$input.first().json.body;const cq=body?.callback_query;if(!cq){return [{json:{ok:false,error:\"Not a callback_query\"}}];}return [{json:{callback_query_id:cq?.id||\"\",callback_data:cq?.data||\"{}\",chat_id:String(cq?.message?.chat?.id||cq?.from?.id||\"\")}}];"
+      }
+    },
+    {
+      "id": "http-forward-hitl",
+      "name": "Forward to HITL Callback",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1000, 150],
+      "parameters": {
+        "method": "POST",
+        "url": "https://@@N8N_DOMAIN@@/webhook/hitl-callback",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "if-slash",
+      "name": "Is Slash Command?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [500, 600],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.body?.message?.text || \"\" }}",
+              "operation": "startsWith",
+              "value2": "/"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "http-state",
+      "name": "Fetch State",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [750, 450],
+      "parameters": {
+        "method": "GET",
+        "url": "@@GITHUB_PAGES_STATE_URL@@",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 5000
+        }
+      }
+    },
+    {
+      "id": "code-tg",
+      "name": "Parse Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 450],
+      "parameters": {
+        "jsCode": "const body = $('Telegram Webhook').first().json.body;\nconst text = (body?.message?.text || \"\").trim();\nconst chatId = String(body?.message?.chat?.id || \"\");\nlet reply;\nif (text.startsWith(\"/status\")) {\n  const stateResp = $input.first().json;\n  let state = null;\n  try { state = (stateResp && typeof stateResp === 'object') ? stateResp : JSON.parse(String(stateResp)); } catch (e) {}\n  const stages = (state && Array.isArray(state.build_stages)) ? state.build_stages : null;\n  if (stages && stages.length > 0) {\n    const VERB = { completed: '\\u05d4\\u05d5\\u05e9\\u05dc\\u05dd', in_progress: '\\u05d1\\u05e2\\u05d1\\u05d5\\u05d3\\u05d4', pending: '\\u05de\\u05de\\u05ea\\u05d9\\u05df' };\n    const current = stages.find(s => s.status === 'in_progress')\n      || stages.find(s => s.status === 'pending')\n      || [...stages].reverse().find(s => s.status === 'completed');\n    const prs = Array.isArray(state.open_prs) ? state.open_prs : [];\n    reply = '\\u2705 N8N \\u05e4\\u05d5\\u05e2\\u05dc\\n\\u05e9\\u05dc\\u05d1 ' + current.number + ': ' + current.name + ' \\u2014 ' + (VERB[current.status] || VERB.pending) + '\\nPRs \\u05e4\\u05ea\\u05d5\\u05d7\\u05d9\\u05dd: ' + prs.length;\n  } else {\n    reply = '\\u2705 N8N \\u05e4\\u05d5\\u05e2\\u05dc\\n\\u26a0\\ufe0f \\u05dc\\u05d0 \\u05e0\\u05d9\\u05ea\\u05df \\u05dc\\u05e7\\u05e8\\u05d5\\u05d0 state.json';\n  }\n} else if (text.startsWith(\"/agent-session\")) {\n  const bt = \"@@N8N_SECRETS_BROKER_TOKEN@@\";\n  const tw = Math.floor(Date.now() / (30 * 60 * 1000)).toString();\n  const otp = require(\"crypto\").createHmac(\"sha256\", bt).update(tw).digest(\"hex\").substring(0, 16);\n  reply = \"\\ud83d\\udd11 OTP \\u05dc\\u05e1\\u05e9\\u05df:\\n\" + otp + \"\\n\\n\\u05ea\\u05d5\\u05e7\\u05e3: 30 \\u05d3\\u05e7\\u05d5\\u05ea\\n\\u05d4\\u05e2\\u05ea\\u05e7:\\nAGENT_SESSION_OTP=\" + otp;\n} else {\n  reply = \"\\u05e4\\u05e7\\u05d5\\u05d3\\u05d5\\u05ea \\u05d6\\u05de\\u05d9\\u05e0\\u05d5\\u05ea:\\n/status \\u2014 \\u05e1\\u05d8\\u05d0\\u05d8\\u05d5\\u05e1 \\u05d4\\u05de\\u05e2\\u05e8\\u05db\\u05ea\\n/agent-session \\u2014 OTP \\u05dc\\u05e1\\u05e9\\u05df \\u05d7\\u05d3\\u05e9\";\n}\nreturn [{json: {chat_id: chatId, reply_text: reply}}];"
+      }
+    },
+    {
+      "id": "telegram-tg",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1250, 450],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply_text }}"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "@@CRED_TELEGRAM_ID@@",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "http-forward-router",
+      "name": "Forward to Router",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [750, 750],
+      "parameters": {
+        "method": "POST",
+        "url": "https://@@N8N_DOMAIN@@/webhook/agent-router",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.body?.message?.text || \"\", chat_id: String($json.body?.message?.chat?.id || \"\") }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 40000
+        }
+      }
+    },
+    {
+      "id": "respond-tg",
+      "name": "Respond to Telegram",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1500, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"ok\":true}"
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Webhook": {
+      "main": [[{"node": "Is Callback Query?", "type": "main", "index": 0}]]
+    },
+    "Is Callback Query?": {
+      "main": [
+        [{"node": "Extract Callback", "type": "main", "index": 0}],
+        [{"node": "Is Slash Command?", "type": "main", "index": 0}]
+      ]
+    },
+    "Extract Callback": {
+      "main": [[{"node": "Forward to HITL Callback", "type": "main", "index": 0}]]
+    },
+    "Forward to HITL Callback": {
+      "main": [[{"node": "Respond to Telegram", "type": "main", "index": 0}]]
+    },
+    "Is Slash Command?": {
+      "main": [
+        [{"node": "Fetch State", "type": "main", "index": 0}],
+        [{"node": "Forward to Router", "type": "main", "index": 0}]
+      ]
+    },
+    "Fetch State": {
+      "main": [[{"node": "Parse Command", "type": "main", "index": 0}]]
+    },
+    "Parse Command": {
+      "main": [[{"node": "Send Reply", "type": "main", "index": 0}]]
+    },
+    "Send Reply": {
+      "main": [[{"node": "Respond to Telegram", "type": "main", "index": 0}]]
+    },
+    "Forward to Router": {
+      "main": [[{"node": "Respond to Telegram", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {"executionOrder": "v1"}
+}

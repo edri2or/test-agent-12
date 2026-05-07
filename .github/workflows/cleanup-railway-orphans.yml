@@ -1,0 +1,120 @@
+name: Cleanup orphaned Railway projects
+
+# One-shot utility to delete Railway projects whose GCP/GitHub clones have already
+# been deleted, leaving the Railway project orphaned. Reads the account-level token
+# from the template-builder's SM, lists all projects, and deletes those matching
+# the provided name prefix.
+#
+# Safety: requires explicit prefix confirmation. Only deletes projects whose name
+# starts with the given prefix AND that you confirm match the orphan pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      name_prefix:
+        description: 'Delete Railway projects whose name starts with this prefix (e.g. "test-agent-07")'
+        required: true
+      confirm:
+        description: 'Type "DELETE" to confirm'
+        required: true
+      dry_run:
+        description: 'Set to "true" to list without deleting'
+        default: 'true'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cleanup-orphans:
+    name: Delete Railway projects matching "${{ inputs.name_prefix }}*"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate
+        run: |
+          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
+            echo "::error::Confirmation must be 'DELETE'. Got: ${{ inputs.confirm }}"
+            exit 1
+          fi
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Read Railway account token from SM
+        id: token
+        run: |
+          TOKEN="$(gcloud secrets versions access latest \
+            --secret=railway-api-token --project="${{ vars.GCP_PROJECT_ID }}")"
+          echo "::add-mask::$TOKEN"
+          echo "railway_token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: List + delete matching Railway projects
+        env:
+          RAILWAY_TOKEN: ${{ steps.token.outputs.railway_token }}
+          PREFIX:        ${{ inputs.name_prefix }}
+          DRY_RUN:       ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          # List all projects via account-level token
+          LIST_RESPONSE=$(curl -s -X POST "https://backboard.railway.app/graphql/v2" \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -H "User-Agent: autonomous-agent-template-builder/1.0 (+cleanup-railway-orphans.yml)" \
+            -d '{"query":"{ me { projects { edges { node { id name } } } } }"}')
+
+          # Filter projects matching prefix
+          MATCHES=$(echo "$LIST_RESPONSE" | python3 -c "
+          import json, sys, os
+          data = json.load(sys.stdin)
+          prefix = os.environ['PREFIX']
+          projects = data.get('data', {}).get('me', {}).get('projects', {}).get('edges', [])
+          for edge in projects:
+            node = edge.get('node', {})
+            if node.get('name', '').startswith(prefix):
+              print(f\"{node['id']}  {node['name']}\")
+          ")
+
+          if [[ -z "$MATCHES" ]]; then
+            echo "::notice::No Railway projects found matching prefix '$PREFIX'"
+            echo "## No matching Railway projects found" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "## Matching Railway projects (prefix: \`$PREFIX\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Project ID | Name | Action |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------------|------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r line; do
+            PROJECT_ID=$(echo "$line" | awk '{print $1}')
+            PROJECT_NAME=$(echo "$line" | awk '{print $2}')
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "::notice::DRY RUN — would delete Railway project $PROJECT_NAME ($PROJECT_ID)"
+              echo "| \`$PROJECT_ID\` | \`$PROJECT_NAME\` | dry-run (skipped) |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            RESP=$(curl -s -X POST "https://backboard.railway.app/graphql/v2" \
+              -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "User-Agent: autonomous-agent-template-builder/1.0 (+cleanup-railway-orphans.yml)" \
+              -d "{\"query\":\"mutation { projectDelete(id: \\\"$PROJECT_ID\\\") }\"}")
+
+            if echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('data',{}).get('projectDelete') else 1)" 2>/dev/null; then
+              echo "::notice::Deleted Railway project $PROJECT_NAME ($PROJECT_ID)"
+              echo "| \`$PROJECT_ID\` | \`$PROJECT_NAME\` | ✅ deleted |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::Failed to delete $PROJECT_NAME ($PROJECT_ID): $(echo "$RESP" | head -c 300)"
+              echo "| \`$PROJECT_ID\` | \`$PROJECT_NAME\` | ⚠ failed |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "$MATCHES"

@@ -1,0 +1,84 @@
+name: Probe all Cloudflare tokens
+
+# Iterates every Cloudflare-related secret in GCP Secret Manager and
+# calls /user/tokens/verify against each. Surfaces which tokens are
+# valid and (when valid) their token-id and status. Used to find a
+# token with User:API Tokens:Edit permission so we can programmatically
+# rotate the broken cloudflare-api-token.
+#
+# Built 2026-05-02 to find the operator's "token-creator" token
+# referenced in Hebrew chat as having "permission to create tokens".
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  probe-all:
+    name: Probe all CF tokens
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Iterate + verify each candidate
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          # Sequential loop in one runner; previous matrix-of-5 cost ~150s
+          # of duplicate WIF auth + setup-gcloud per token (collapsed
+          # 2026-05-02 per simplify review).
+          # No bash -e — surface every per-token failure mode independently.
+          CANDIDATES=(
+            cloudflare-api-token
+            cloudflare-dns-manager-token
+            CLOUDFLARE_USER_ADDITIONAL_API
+            CLOUDFLARE_ACCOUNT_ADDITIONAL_API
+            CLOUDFLARE_API_TOKEN
+          )
+          for SECRET_NAME in "${CANDIDATES[@]}"; do
+            echo "::group::$SECRET_NAME"
+            if ! TOKEN=$(gcloud secrets versions access latest \
+                --secret="$SECRET_NAME" --project="$GCP_PROJECT_ID" 2>/dev/null); then
+              echo "::warning title=$SECRET_NAME::secret not found in $GCP_PROJECT_ID"
+              echo "::endgroup::"
+              continue
+            fi
+            TOKEN=$(printf '%s' "$TOKEN" | tr -d '\n')
+            LEN=${#TOKEN}
+            echo "$SECRET_NAME byte length: $LEN"
+
+            STATUS=$(curl -s -o /tmp/r.json -w "%{http_code}" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/json" \
+              https://api.cloudflare.com/client/v4/user/tokens/verify)
+            if [ "$STATUS" = "200" ]; then
+              TOKEN_ID=$(jq -r '.result.id // "unknown"' /tmp/r.json)
+              TOKEN_STATUS=$(jq -r '.result.status // "unknown"' /tmp/r.json)
+              echo "::notice title=$SECRET_NAME-VALID::HTTP $STATUS len=$LEN id=$TOKEN_ID status=$TOKEN_STATUS"
+
+              DETAIL_STATUS=$(curl -s -o /tmp/d.json -w "%{http_code}" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/json" \
+                "https://api.cloudflare.com/client/v4/user/tokens/$TOKEN_ID")
+              if [ "$DETAIL_STATUS" = "200" ]; then
+                PERMS=$(jq -r '[.result.policies[]?.permission_groups[]?.name] | join("|")' /tmp/d.json 2>/dev/null || echo parse-fail)
+                echo "::notice title=$SECRET_NAME-PERMS::$PERMS"
+              else
+                echo "::notice title=$SECRET_NAME-no-self-detail::HTTP $DETAIL_STATUS (token may lack User:API Tokens:Read)"
+              fi
+            else
+              BODY=$(tr '\n' '|' < /tmp/r.json | head -c 600)
+              echo "::warning title=$SECRET_NAME-INVALID::HTTP $STATUS len=$LEN body=$BODY"
+            fi
+            echo "::endgroup::"
+          done

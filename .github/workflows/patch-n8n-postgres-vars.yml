@@ -1,0 +1,202 @@
+name: Patch n8n vars (one-shot fix)
+
+# One-shot operational workflow: injects the minimum set of env vars required
+# for n8n to start reliably on a clone that was provisioned before bootstrap
+# ran. Sets a stable N8N_ENCRYPTION_KEY (generating + persisting to SM if
+# absent) and the individual DB_POSTGRESDB_* vars.
+#
+# Why N8N_ENCRYPTION_KEY matters: without it n8n generates a random key on
+# each container start, stores it in an ephemeral file, and crashes on the
+# next restart because the DB settings were encrypted with a different key.
+#
+# n8n only supports individual DB_POSTGRESDB_{HOST,PORT,DATABASE,USER,
+# PASSWORD,SSL_ENABLED,SSL_REJECT_UNAUTHORIZED} - not DATABASE_URL.
+#
+# Reads Railway service IDs from the clone's GCP Secret Manager, then calls
+# variableCollectionUpsert to inject the correct vars using Railway reference
+# variable syntax (ServiceName.VAR) which Railway resolves at runtime.
+# Triggers a service redeploy via serviceInstanceRedeploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcp_project_id:
+        description: 'GCP project ID for the clone (e.g. or-my-agent-test-5-5)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  patch:
+    name: Patch n8n vars in ${{ inputs.gcp_project_id }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Fetch Railway credentials from Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            railway-api-token:${{ inputs.gcp_project_id }}/railway-api-token
+            railway-project-id:${{ inputs.gcp_project_id }}/railway-project-id
+            railway-environment-id:${{ inputs.gcp_project_id }}/railway-environment-id
+            railway-n8n-service-id:${{ inputs.gcp_project_id }}/railway-n8n-service-id
+
+      - name: Ensure n8n-encryption-key exists in Secret Manager
+        id: enc_key
+        run: |
+          KEY=$(gcloud secrets versions access latest \
+            --secret="n8n-encryption-key" \
+            --project="${{ inputs.gcp_project_id }}" 2>/dev/null || true)
+          if [ -z "$KEY" ]; then
+            KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+            # Create container (no-op if already exists), then add version.
+            # Using create+versions add avoids ALREADY_EXISTS failure when the
+            # secret container exists but all versions were previously destroyed.
+            gcloud secrets create "n8n-encryption-key" \
+              --project="${{ inputs.gcp_project_id }}" \
+              --replication-policy=automatic 2>/dev/null || true
+            printf '%s' "$KEY" | gcloud secrets versions add "n8n-encryption-key" \
+              --project="${{ inputs.gcp_project_id }}" \
+              --data-file=-
+            echo "::notice::Generated new n8n-encryption-key and stored in SM"
+          else
+            echo "::notice::Read existing n8n-encryption-key from SM"
+          fi
+          echo "n8n_key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Inject vars and redeploy
+        env:
+          RAILWAY_API_TOKEN:  ${{ steps.secrets.outputs.railway-api-token }}
+          PROJECT_ID:         ${{ steps.secrets.outputs.railway-project-id }}
+          ENVIRONMENT_ID:     ${{ steps.secrets.outputs.railway-environment-id }}
+          N8N_SERVICE_ID:     ${{ steps.secrets.outputs.railway-n8n-service-id }}
+          N8N_ENCRYPTION_KEY: ${{ steps.enc_key.outputs.n8n_key }}
+          GCP_PROJECT_ID:     ${{ inputs.gcp_project_id }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          token   = os.environ["RAILWAY_API_TOKEN"]
+          pid     = os.environ["PROJECT_ID"]
+          eid     = os.environ["ENVIRONMENT_ID"]
+          n8n_sid = os.environ["N8N_SERVICE_ID"]
+          enc_key = os.environ["N8N_ENCRYPTION_KEY"]
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+
+          HEADERS = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+            "User-Agent":    "autonomous-agent-template-builder/1.0 (+patch-n8n-postgres-vars.yml)",
+          }
+
+          def gql(payload):
+            req = urllib.request.Request(
+              "https://backboard.railway.app/graphql/v2",
+              data=json.dumps(payload).encode(),
+              headers=HEADERS,
+              method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+              return json.loads(resp.read())
+
+          def w(line=""):
+            with open(summary, "a") as f:
+              f.write(line + "\n")
+
+          w("# Patch n8n vars")
+          w()
+          w(f"- GCP project: `{os.environ['GCP_PROJECT_ID']}`")
+          w(f"- n8n service id: `{n8n_sid}`")
+          w()
+
+          # Railway reference vars use brace-doubled syntax, built at Python runtime
+          # to avoid GitHub Actions evaluating them at YAML parse time.
+          def ref(var): return "$" + "{{Postgres." + var + "}}"
+          NEW_VARS = {
+            "N8N_ENCRYPTION_KEY":                  enc_key,
+            "N8N_USER_FOLDER":                     "/tmp/n8n-data",
+            "DB_TYPE":                              "postgresdb",
+            "DB_POSTGRESDB_HOST":                   ref("RAILWAY_PRIVATE_DOMAIN"),
+            "DB_POSTGRESDB_PORT":                   "5432",
+            "DB_POSTGRESDB_DATABASE":               ref("POSTGRES_DB"),
+            "DB_POSTGRESDB_USER":                   ref("POSTGRES_USER"),
+            "DB_POSTGRESDB_PASSWORD":               ref("POSTGRES_PASSWORD"),
+            "DB_POSTGRESDB_SSL_ENABLED":            "true",
+            "DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED": "false",
+          }
+
+          upsert_q = """
+          mutation($input: VariableCollectionUpsertInput!) {
+            variableCollectionUpsert(input: $input)
+          }
+          """
+          try:
+            body = gql({"query": upsert_q, "variables": {
+              "input": {"projectId": pid, "environmentId": eid, "serviceId": n8n_sid, "variables": NEW_VARS}
+            }})
+            if "errors" in body:
+              w(f"upsert failed: {body['errors']}")
+              print(f"::error::variableCollectionUpsert failed: {body['errors']}")
+              sys.exit(1)
+            w("N8N_ENCRYPTION_KEY + N8N_USER_FOLDER + DB_POSTGRESDB_* vars upserted successfully")
+            print("::notice::vars upserted on n8n service")
+          except Exception as e:
+            w(f"upsert exception: {e}")
+            print(f"::error::upsert exception: {e}")
+            sys.exit(1)
+
+          # Delete deprecated / wrong vars - including invalid owner env vars
+          delete_q = """
+          mutation($input: VariableDeleteInput!) {
+            variableDelete(input: $input)
+          }
+          """
+          for old_var in (
+            "DATABASE_URL",
+            "DB_POSTGRESDB_URL",
+            "N8N_RUNNERS_ENABLED",
+            "N8N_INSTANCE_OWNER_MANAGED_BY_ENV",
+            "N8N_INSTANCE_OWNER_PASSWORD_HASH",
+            "N8N_INSTANCE_OWNER_PASSWORD",
+            "N8N_INSTANCE_OWNER_EMAIL",
+          ):
+            try:
+              gql({"query": delete_q, "variables": {
+                "input": {"projectId": pid, "environmentId": eid, "serviceId": n8n_sid, "name": old_var}
+              }})
+              w(f"Deleted old var {old_var}")
+              print(f"::notice::Deleted old var {old_var}")
+            except Exception as e:
+              w(f"Could not delete {old_var} (may not exist): {e}")
+
+          # Trigger redeploy
+          redeploy_q = """
+          mutation($serviceId: String!, $environmentId: String!) {
+            serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
+          }
+          """
+          try:
+            body = gql({"query": redeploy_q, "variables": {"serviceId": n8n_sid, "environmentId": eid}})
+            if "errors" in body:
+              w(f"redeploy mutation errors: {body['errors']}")
+              print(f"::warning::redeploy errors: {body['errors']}")
+            else:
+              w("n8n service redeploy triggered")
+              print("::notice::n8n service redeploy triggered")
+          except Exception as e:
+            w(f"redeploy exception: {e}")
+            print(f"::warning::redeploy exception: {e}")
+
+          w()
+          w("Vars injected. Run probe-railway.yml with project_name + fail_on_crashed=true after ~3 min to verify.")
+          PYEOF

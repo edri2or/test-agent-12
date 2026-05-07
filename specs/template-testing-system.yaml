@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: template-testing-system
+  description: "Dedicated clone for automated template validation — exercises the full provisioning pipeline"
+spec:
+  gcp:
+    projectId: or-template-testing-001
+    region: us-central1
+  github:
+    repo: edri2or/template-testing-system
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: template-testing.or-infra.com
+    worker:
+      name: template-testing-edge
+      route: template-testing.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "dedicated system for end-to-end template provisioning validation"

@@ -1,0 +1,114 @@
+name: Cleanup test-agent clones (repos + GCP projects)
+
+# Purpose: delete edri2or/test-agent-NN GitHub repos and their GCP projects.
+# The runtime SA has roles/owner on each clone project (created via grant-autonomy.sh).
+# Defensive guard: only accepts or-test-agent-NN pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Comma-separated GitHub repos to delete (owner/repo format)'
+        required: true
+        default: 'edri2or/test-agent-02,edri2or/test-agent-03,edri2or/test-agent-04'
+      gcp_projects:
+        description: 'Comma-separated GCP project IDs (must match or-test-agent-NN)'
+        required: true
+        default: 'or-test-agent-02,or-test-agent-03,or-test-agent-04'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cleanup:
+    name: Delete test-agent repos and GCP projects
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Validate GCP project pattern
+        run: |
+          IFS=',' read -ra PIDS <<< "${{ inputs.gcp_projects }}"
+          for pid in "${PIDS[@]}"; do
+            pid_trim=$(echo "$pid" | tr -d ' ')
+            if ! [[ "$pid_trim" =~ ^or-test-agent-[0-9]{2}$ ]]; then
+              echo "::error::REFUSED: '$pid_trim' does not match or-test-agent-NN (defensive guard)"
+              exit 1
+            fi
+          done
+          echo "::notice::Pattern OK — all IDs match or-test-agent-NN"
+
+      - name: Delete GitHub repos
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOS:    ${{ inputs.repos }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra REPO_LIST <<< "$REPOS"
+          for repo in "${REPO_LIST[@]}"; do
+            repo=$(echo "$repo" | tr -d ' ')
+            code=$(curl -s -o /tmp/out.txt -w "%{http_code}" -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$repo")
+            if [ "$code" = "204" ]; then
+              echo "::notice::Deleted GitHub repo $repo"
+            elif [ "$code" = "404" ]; then
+              echo "::notice::$repo not found — skipping"
+            else
+              echo "::warning::DELETE $repo → $code: $(cat /tmp/out.txt | head -c 200)"
+            fi
+          done
+
+      - name: Delete GCP projects
+        env:
+          GCP_PROJECTS: ${{ inputs.gcp_projects }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra PROJECT_LIST <<< "$GCP_PROJECTS"
+          for project in "${PROJECT_LIST[@]}"; do
+            project=$(echo "$project" | tr -d ' ')
+            if gcloud projects describe "$project" >/dev/null 2>&1; then
+              if gcloud projects delete "$project" --quiet 2>&1; then
+                echo "::notice::Deleted GCP project $project"
+              else
+                echo "::warning::Could not delete $project — may need manual cleanup"
+              fi
+            else
+              echo "::notice::GCP project $project not found — skipping"
+            fi
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Cleanup complete"
+            echo ""
+            echo "- GitHub repos: \`${{ inputs.repos }}\`"
+            echo "- GCP projects: \`${{ inputs.gcp_projects }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,308 @@
+name: Probe Railway
+
+# Read-only probe of the operator's Railway account state.
+# Per ADR-0008: classifies the account into state A / B / C so a later
+# provisioner workflow knows which mutations (if any) to run.
+#
+# This workflow makes ZERO mutations — it only runs the GraphQL `me` query
+# and writes the classification + raw projects JSON to GITHUB_STEP_SUMMARY.
+#
+# Auth: secrets.RAILWAY_API_TOKEN must be an account token (not project /
+# workspace). Per docs.railway.com/integrations/api/graphql-overview, only
+# account tokens can resolve `me`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: 'Project name to target (empty = use DEFAULT_PROJECT_NAME classifier)'
+        required: false
+        type: string
+      fetch_logs:
+        description: 'Fetch deployment logs for CRASHED/FAILED services'
+        required: false
+        type: boolean
+        default: false
+      fail_on_crashed:
+        description: 'Exit non-zero (job conclusion=failure) if any service is CRASHED or FAILED. Use when the probe is a health gate, not just a diagnostic read.'
+        required: false
+        type: boolean
+        default: false
+  # First-time bootstrap + re-probe-on-edit: GitHub's workflow_dispatch REST
+  # API only resolves workflows registered on the default branch, so the
+  # path-scoped pull_request trigger lets the probe self-register on the PR
+  # that introduces it, and re-runs whenever its YAML changes.
+  pull_request:
+    paths:
+      - '.github/workflows/probe-railway.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Classify Railway account state
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe via GraphQL
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          # Names the agent looks for inside each project.
+          # Kept out of the script so they're easy to retune without code edits.
+          AGENT_SERVICE_NAME: agent
+          N8N_SERVICE_NAME: n8n
+          DEFAULT_PROJECT_NAME: ${{ inputs.project_name || 'autonomous-agent' }}
+          FILTER_PROJECT: ${{ inputs.project_name || '' }}
+          FETCH_LOGS: ${{ inputs.fetch_logs || 'false' }}
+          FAIL_ON_CRASHED: ${{ inputs.fail_on_crashed || 'false' }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          token = os.environ["RAILWAY_API_TOKEN"]
+          n8n_name   = os.environ["N8N_SERVICE_NAME"]
+          agent_name = os.environ["AGENT_SERVICE_NAME"]
+          default_project_name = os.environ["DEFAULT_PROJECT_NAME"]
+          fetch_logs    = os.environ.get("FETCH_LOGS", "false").lower() == "true"
+          fail_on_crashed = os.environ.get("FAIL_ON_CRASHED", "false").lower() == "true"
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+
+          # GitHub caps step summary at ~1 MiB and annotation messages
+          # at ~64 KiB; these slices stay well below both ceilings.
+          STEP_SUMMARY_ERROR_CHARS   = 3000
+          STEP_SUMMARY_PAYLOAD_CHARS = 8000
+          ANNOTATION_CHARS           = 2000
+
+          # Cloudflare on backboard.railway.app rejects the default
+          # `Python-urllib/3.x` User-Agent with error code 1010 (Browser
+          # Integrity Check). A non-bot UA + Accept header passes.
+          # Callers own exception handling — gql() propagates all errors.
+          def gql(payload):
+            req = urllib.request.Request(
+              "https://backboard.railway.app/graphql/v2",
+              data=json.dumps(payload).encode(),
+              headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json",
+                "Accept":        "application/json",
+                "User-Agent":    "autonomous-agent-template-builder/1.0 (+probe-railway.yml)",
+              },
+              method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+              return json.loads(resp.read())
+
+          # `me.projects` returns only personal-scope projects; projects created
+          # via `projectCreate(workspaceId=...)` appear under
+          # `me.workspaces[*].projects` and are invisible otherwise.
+          PROJECT_FRAGMENT = """
+            id name
+            services { edges { node { id name } } }
+            environments { edges { node { id name } } }
+          """
+          query = """
+          query Probe {
+            me {
+              id
+              name
+              email
+              workspaces {
+                id name
+                projects {
+                  edges { node { %(fragment)s } }
+                }
+              }
+              projects {
+                edges { node { %(fragment)s } }
+              }
+            }
+          }
+          """ % {"fragment": PROJECT_FRAGMENT}
+
+          try:
+            body = gql({"query": query})
+          except urllib.error.HTTPError as e:
+            body = {"_http_error": e.code, "_body": e.read().decode("utf-8", "replace")}
+          except Exception as e:
+            body = {"_transport_error": repr(e)}
+
+          # Write a structured summary regardless of outcome — the goal is
+          # diagnosability, not pretty-printing only on the happy path.
+          def w(line=""):
+            with open(summary_path, "a") as f:
+              f.write(line + "\n")
+
+          w("# Railway probe — ADR-0008")
+          w()
+
+          if "errors" in body or "_http_error" in body or "_transport_error" in body:
+            w("## ❌ Probe failed")
+            w()
+            w("```json")
+            w(json.dumps(body, indent=2)[:STEP_SUMMARY_ERROR_CHARS])
+            w("```")
+            w()
+            w("Likely causes: token is project/workspace-scoped (not account), "
+              "endpoint moved, or rate-limited. See ADR-0008 → Risks.")
+            # Also emit as a workflow annotation so the failure body is
+            # readable via the check-runs API (the step-summary file lives
+            # behind the Azure log blob, which is not always accessible).
+            err = json.dumps(body)[:ANNOTATION_CHARS].replace("\n", " ").replace("%", "%25")
+            print(f"::error title=Railway probe failed::{err}")
+            sys.exit(1)
+
+          me = body.get("data", {}).get("me") or {}
+
+          all_projects_by_id = {}
+          personal_count = 0
+          workspace_count = 0
+          for edge in (me.get("projects", {}).get("edges") or []):
+            p = edge["node"]
+            personal_count += 1
+            all_projects_by_id.setdefault(p["id"], p)
+          for ws in (me.get("workspaces") or []):
+            for edge in (ws.get("projects", {}).get("edges") or []):
+              p = edge["node"]
+              workspace_count += 1
+              all_projects_by_id.setdefault(p["id"], p)
+          projects = list(all_projects_by_id.values())
+
+          # Classification per ADR-0008.
+          # When project_name input is specified, restrict to that project only.
+          filter_project = os.environ.get("FILTER_PROJECT", "").strip()
+          candidate_pool = [p for p in projects if p["name"] == filter_project] if filter_project else projects
+          if filter_project and not candidate_pool:
+            print(f"::warning::project_name={filter_project!r} matched no projects ({len(projects)} total visible).")
+
+          state = "C"
+          adopted_project = None
+          for p in candidate_pool:
+            svc_names = {s["node"]["name"] for s in (p.get("services", {}).get("edges") or [])}
+            if n8n_name in svc_names and agent_name in svc_names:
+              state = "A"
+              adopted_project = p
+              break
+
+          if state == "C" and candidate_pool:
+            # State B: a project exists but is missing one or both target services.
+            # Prefer the one whose name matches DEFAULT_PROJECT_NAME, else the first.
+            named = next((p for p in candidate_pool if p["name"] == default_project_name), None)
+            adopted_project = named or candidate_pool[0]
+            state = "B"
+
+          w(f"## Result: state={state}")
+          w()
+          w(f"- Authenticated as: `{me.get('email','?')}` (id `{me.get('id','?')}`)")
+          w(f"- Total projects (merged): **{len(projects)}** "
+            f"(me.projects={personal_count}, workspace={workspace_count})")
+          if adopted_project:
+            envs = [e["node"]["name"] for e in (adopted_project.get("environments",{}).get("edges") or [])]
+            svcs = [s["node"]["name"] for s in (adopted_project.get("services",{}).get("edges") or [])]
+            w(f"- Candidate project: `{adopted_project['name']}` (id `{adopted_project['id']}`)")
+            w(f"  - Environments: `{', '.join(envs) or '(none)'}`")
+            w(f"  - Services: `{', '.join(svcs) or '(none)'}`")
+          w()
+          w("Per ADR-0008 → State classification table:")
+          w("- **A** → adopt existing IDs (no mutations)")
+          w("- **B** → partial-provision the missing service(s) in the candidate project")
+          w("- **C** → full-provision (projectCreate + 2× serviceCreate + serviceConnect)")
+          w()
+          w("## Raw projects payload")
+          w()
+          w("```json")
+          w(json.dumps(projects, indent=2)[:STEP_SUMMARY_PAYLOAD_CHARS])
+          w("```")
+
+          print(f"::notice::Railway probe state={state} projects={len(projects)} "
+                f"(me={personal_count} ws={workspace_count})")
+
+          # ── Deployment health (authoritative DeploymentStatus from Railway API) ──
+          # Queries the `deployments` field — the same source the Railway dashboard reads.
+          # Soft-fail: if API shape changes, skip without breaking the A/B/C probe above.
+          if adopted_project:
+            pid = adopted_project["id"]
+            envs = adopted_project.get("environments", {}).get("edges", [])
+            eid = envs[0]["node"]["id"] if envs else None
+
+            if eid:
+              deploy_q = """
+              query Deployments($pid: String!, $eid: String!) {
+                deployments(input: { projectId: $pid, environmentId: $eid }) {
+                  edges { node { id status serviceId createdAt } }
+                }
+              }
+              """
+              logs_q = """
+              query Logs($deploymentId: String!) {
+                deploymentLogs(deploymentId: $deploymentId, limit: 100) {
+                  message severity timestamp
+                }
+              }
+              """
+              try:
+                body2 = gql({"query": deploy_q, "variables": {"pid": pid, "eid": eid}})
+
+                deploys = body2.get("data", {}).get("deployments", {}).get("edges", [])
+                # Keep only the latest deployment per service (list is newest-first).
+                # Store (status, deploy_id) so log-fetching can reference the deploy.
+                latest = {}  # sid -> (status, deploy_id)
+                for e in deploys:
+                  n = e["node"]
+                  sid = n["serviceId"]
+                  if sid not in latest:
+                    latest[sid] = (n["status"], n["id"])
+
+                svc_id_to_name = {
+                  s["node"]["id"]: s["node"]["name"]
+                  for s in adopted_project.get("services", {}).get("edges", [])
+                }
+
+                status_parts = []
+                crashed = []
+                for sid, (st, deploy_id) in latest.items():
+                  svc = svc_id_to_name.get(sid, sid[:8])
+                  status_parts.append(f"{svc}={st}")
+                  if st in ("CRASHED", "FAILED"):
+                    crashed.append((sid, svc))
+                    print(f"::error title={svc} {st}::Service `{svc}` deployment status is {st}.")
+                    if fetch_logs:
+                      try:
+                        body3 = gql({"query": logs_q, "variables": {"deploymentId": deploy_id}})
+                        logs = (body3.get("data") or {}).get("deploymentLogs") or []
+                        w()
+                        w(f"## Crash logs: `{svc}` (deployment `{deploy_id[:8]}`)")
+                        w()
+                        w("```")
+                        for line in logs:
+                          sev = line.get("severity") or ""
+                          msg = line.get("message") or ""
+                          w(f"[{sev}] {msg}")
+                        w("```")
+                        # Emit logs as a single ::notice:: so they are readable
+                        # via the annotations API (step summary is not API-accessible).
+                        log_blob = " | ".join(
+                          f"[{l.get('severity','')}] {l.get('message','')}"
+                          for l in logs
+                        )[:2000].replace("\n", " ").replace("%", "%25")
+                        print(f"::notice title={svc} crash logs::{log_blob}")
+                      except Exception as ex:
+                        w(f"\n⚠ logs fetch for `{svc}` failed: {ex}")
+                        print(f"::warning::probe logs fetch for {svc} failed: {ex}")
+
+                status_str = " ".join(status_parts) if status_parts else "no_deployments"
+
+                w()
+                w(f"## Deployment status: {status_str}")
+                w()
+                w("*(Source: Railway `deployments` GraphQL API — authoritative, not proxy-layer HTTP)*")
+                print(f"::notice::Railway deployment status: {status_str}")
+
+                if fail_on_crashed and crashed:
+                  names = [svc for _, svc in crashed]
+                  print(f"::error::{len(crashed)} service(s) CRASHED/FAILED (fail_on_crashed gate): {', '.join(names)}")
+                  sys.exit(1)
+
+              except Exception as ex:
+                w(f"\n⚠ deployments query skipped: {ex}")
+                print(f"::warning::probe deploymentStatus skipped: {ex}")
+          PYEOF

@@ -1,0 +1,307 @@
+name: Stage 5 — Configure Telegram Operator Interface
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  configure:
+    name: Wire Telegram bot → N8N webhook + E2E gate
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      N8N_OWNER_EMAIL: ${{ vars.N8N_OWNER_EMAIL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch secrets from GCP Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            railway-api-token:${{ vars.GCP_PROJECT_ID }}/railway-api-token
+            telegram-bot-token:${{ vars.GCP_PROJECT_ID }}/telegram-bot-token
+            TELEGRAM_CHAT_ID:${{ vars.GCP_PROJECT_ID }}/TELEGRAM_CHAT_ID
+            n8n-admin-password-plaintext:${{ vars.GCP_PROJECT_ID }}/n8n-admin-password-plaintext
+            railway-project-id:${{ vars.GCP_PROJECT_ID }}/railway-project-id
+            railway-environment-id:${{ vars.GCP_PROJECT_ID }}/railway-environment-id
+            n8n-secrets-broker-token:${{ vars.GCP_PROJECT_ID }}/n8n-secrets-broker-token
+      - name: Export Railway project/environment IDs to env
+        run: |
+          echo "RAILWAY_PROJECT_ID=${{ steps.secrets.outputs.railway-project-id }}" >> "$GITHUB_ENV"
+          echo "RAILWAY_ENVIRONMENT_ID=${{ steps.secrets.outputs.railway-environment-id }}" >> "$GITHUB_ENV"
+
+      - name: Resolve N8N Railway service domain + service ID
+        id: domain
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+        run: |
+          RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){services{edges{node{id name}}}}}","variables":{"pid":$pid}}')")
+
+          N8N_SVC_ID=$(echo "$RESP" | jq -r \
+            '[.data.project.services.edges[] | select(.node.name == "n8n")] | first | .node.id // empty')
+          [ -n "$N8N_SVC_ID" ] || { echo "::error::N8N service not found in Railway project"; exit 1; }
+
+          DOMAINS_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg sid "$N8N_SVC_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+              '{"query":"query($sid:String!,$eid:String!){serviceInstance(serviceId:$sid,environmentId:$eid){domains{serviceDomains{id domain}}}}","variables":{"sid":$sid,"eid":$eid}}')")
+
+          N8N_DOMAIN=$(echo "$DOMAINS_RESP" | jq -r \
+            '(.data.serviceInstance.domains.serviceDomains // []) | .[0].domain // empty')
+          [ -n "$N8N_DOMAIN" ] || { echo "::error::N8N Railway service domain not found"; exit 1; }
+
+          echo "N8N domain: $N8N_DOMAIN"
+          echo "n8n_domain=$N8N_DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "n8n_svc_id=$N8N_SVC_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for N8N to be healthy
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          CHECK_URL="https://$N8N_DOMAIN/healthz/readiness"
+          for attempt in $(seq 1 10); do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$CHECK_URL" 2>/dev/null)
+            echo "Attempt $attempt/10: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && { echo "N8N is healthy."; break; }
+            [ "$attempt" = "10" ] && { echo "::error::N8N health check failed after 10 attempts"; exit 1; }
+            sleep 15
+          done
+
+      - name: Login to N8N + create CI API key
+        id: n8n_auth
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          N8N_PW: ${{ steps.secrets.outputs.n8n-admin-password-plaintext }}
+        run: |
+          BASE_URL="https://$N8N_DOMAIN"
+
+          LOGIN_RESP=$(curl -s -c /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/login" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn \
+              --arg email "$N8N_OWNER_EMAIL" \
+              --arg pw "$N8N_PW" \
+              '{"emailOrLdapLoginId":$email,"password":$pw}')")
+
+          USER_ID=$(echo "$LOGIN_RESP" | jq -r '.data.id // empty')
+          [ -n "$USER_ID" ] || { echo "::error::N8N login failed. Code: $(echo "$LOGIN_RESP" | jq -r '.code // .message // .')"; exit 1; }
+          echo "Logged in as user $USER_ID"
+
+          EXPIRES=$(( $(date +%s) * 1000 + 3600000 ))
+          APIKEY_RESP=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/api-keys" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --argjson exp "$EXPIRES" \
+              '{"label":"stage5-ci","scopes":["credential:create","credential:list","workflow:create","workflow:list","workflow:update"],"expiresAt":$exp}')")
+
+          N8N_API_KEY=$(echo "$APIKEY_RESP" | jq -r '.data.rawApiKey // empty')
+          N8N_API_KEY_ID=$(echo "$APIKEY_RESP" | jq -r '.data.id // empty')
+          [ -n "$N8N_API_KEY" ] || { echo "::error::Failed to create N8N API key: $APIKEY_RESP"; exit 1; }
+
+          echo "::add-mask::$N8N_API_KEY"
+          echo "n8n_api_key=$N8N_API_KEY" >> "$GITHUB_OUTPUT"
+          echo "n8n_api_key_id=$N8N_API_KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
+          echo "N8N CI API key created (id: $N8N_API_KEY_ID)."
+
+      - name: Create Telegram Bot credential in N8N (idempotent)
+        id: credential
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          TELEGRAM_BOT_TOKEN: ${{ steps.secrets.outputs.telegram-bot-token }}
+        run: |
+          CREDS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/credentials?limit=100")
+          CRED_ID=$(echo "$CREDS" | jq -r \
+            '[(.data // [])[] | select(.name == "Telegram Bot")] | first | .id // empty')
+
+          CRED_PAYLOAD=$(jq -cn \
+            --arg token "$TELEGRAM_BOT_TOKEN" \
+            '{"name":"Telegram Bot","type":"telegramApi","data":{"accessToken":$token}}')
+
+          if [ -n "$CRED_ID" ]; then
+            echo "Patching Telegram Bot credential ($CRED_ID)..."
+            PATCH=$(curl -s -b /tmp/n8n_cookies.txt \
+              -X PATCH "$BASE_URL/rest/credentials/$CRED_ID" \
+              -H "Content-Type: application/json" \
+              -d "$CRED_PAYLOAD")
+            echo "$PATCH" | jq -e '.data.id // .id' > /dev/null 2>&1 \
+              || { echo "::error::Credential patch failed: $PATCH"; exit 1; }
+          else
+            echo "Creating Telegram Bot credential..."
+            CREATE=$(curl -s \
+              -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/credentials" \
+              -H "Content-Type: application/json" \
+              -d "$CRED_PAYLOAD")
+            CRED_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$CRED_ID" ] || { echo "::error::Credential creation failed: $CREATE"; exit 1; }
+            echo "Created credential: $CRED_ID"
+          fi
+
+          echo "credential_id=$CRED_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upsert Telegram Operator Interface workflow in N8N (idempotent)
+        id: workflow
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          CRED_ID: ${{ steps.credential.outputs.credential_id }}
+          N8N_SECRETS_BROKER_TOKEN: ${{ steps.secrets.outputs.n8n-secrets-broker-token }}
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          src=workflows/n8n/telegram-operator-interface.json
+          processed=$(mktemp --suffix=.json)
+          echo "::add-mask::$N8N_SECRETS_BROKER_TOKEN"
+          GITHUB_PAGES_STATE_URL="https://$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1).github.io/$(echo "$GITHUB_REPOSITORY" | cut -d/ -f2)/state.json"
+          sed -e "s|@@CRED_TELEGRAM_ID@@|$CRED_ID|g" \
+              -e "s|@@N8N_DOMAIN@@|$N8N_DOMAIN|g" \
+              -e "s|@@N8N_SECRETS_BROKER_TOKEN@@|$N8N_SECRETS_BROKER_TOKEN|g" \
+              -e "s|@@GITHUB_PAGES_STATE_URL@@|$GITHUB_PAGES_STATE_URL|g" \
+              "$src" > "$processed"
+
+          jq empty "$processed" || { echo "::error::Invalid JSON after substitution"; exit 1; }
+          unmatched=$(grep -oE '@@[A-Z0-9_]+@@' "$processed" | sort -u | tr '\n' ' ' || true)
+          if [ -n "$unmatched" ]; then
+            echo "::error::Unsubstituted placeholder(s) remain: $unmatched"
+            exit 1
+          fi
+
+          WORKFLOWS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/workflows?limit=100")
+          WF_ID=$(echo "$WORKFLOWS" | jq -r \
+            '[(.data // [])[] | select(.name == "Telegram Operator Interface")] | first | .id // empty')
+
+          if [ -n "$WF_ID" ]; then
+            echo "Updating Telegram Operator Interface workflow ($WF_ID)..."
+            PUT_RESP=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X PUT "$BASE_URL/api/v1/workflows/$WF_ID" \
+              -H "Content-Type: application/json" \
+              --data-binary @"$processed")
+            echo "$PUT_RESP" | jq -e '.data.id // .id' > /dev/null 2>&1 \
+              || { echo "::error::Workflow update failed: $PUT_RESP"; exit 1; }
+            echo "Workflow updated."
+          else
+            echo "Creating Telegram Operator Interface workflow..."
+            CREATE=$(curl -s \
+              -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/workflows" \
+              -H "Content-Type: application/json" \
+              --data-binary @"$processed")
+            WF_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$WF_ID" ] || { echo "::error::Workflow creation failed: $CREATE"; exit 1; }
+            echo "Created workflow: $WF_ID"
+          fi
+
+          rm -f "$processed"
+          echo "workflow_id=$WF_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Activate Telegram workflow
+        id: activate
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          WF_ID: ${{ steps.workflow.outputs.workflow_id }}
+        run: |
+          WF_RESP=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/workflows/$WF_ID")
+          ACTIVE=$(echo "$WF_RESP" | jq -r '.data.active // "false"')
+          VERSION_ID=$(echo "$WF_RESP" | jq -r '.data.versionId // empty')
+          [ -n "$VERSION_ID" ] || { echo "::error::versionId missing in REST response: $WF_RESP"; exit 1; }
+
+          if [ "$ACTIVE" = "true" ]; then
+            echo "Workflow active — re-activating to pick up latest code..."
+            curl -s -b /tmp/n8n_cookies.txt -X POST "$BASE_URL/rest/workflows/$WF_ID/deactivate" > /dev/null
+          fi
+
+          echo "Activating workflow $WF_ID (versionId: $VERSION_ID)..."
+          ACTIVATE=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/workflows/$WF_ID/activate" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg vid "$VERSION_ID" '{"versionId":$vid}')")
+          ACTIVATED=$(echo "$ACTIVATE" | jq -r '.data.active // "false"')
+          [ "$ACTIVATED" = "true" ] || { echo "::error::Failed to activate workflow: $ACTIVATE"; exit 1; }
+          echo "Workflow activated."
+
+      - name: Register Telegram webhook (setWebhook)
+        id: register_webhook
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ steps.secrets.outputs.telegram-bot-token }}
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          WEBHOOK_URL="https://$N8N_DOMAIN/webhook/telegram"
+          echo "Registering Telegram webhook: $WEBHOOK_URL"
+
+          RESP=$(curl -s \
+            -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg url "$WEBHOOK_URL" \
+              '{"url":$url,"allowed_updates":["message"]}')") 
+
+          OK=$(echo "$RESP" | jq -r '.ok // "false"')
+          [ "$OK" = "true" ] || { echo "::error::setWebhook failed: $RESP"; exit 1; }
+          echo "Telegram webhook registered: $WEBHOOK_URL"
+          echo "webhook_url=$WEBHOOK_URL" >> "$GITHUB_OUTPUT"
+
+      - name: E2E — POST simulated /status → N8N processes → Telegram reply
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          TELEGRAM_CHAT_ID: ${{ steps.secrets.outputs.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "Sending simulated /status update to N8N webhook..."
+          RESP=$(curl -s --max-time 45 \
+            -X POST "https://$N8N_DOMAIN/webhook/telegram" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn \
+              --arg chat_id "$TELEGRAM_CHAT_ID" \
+              '{"message":{"text":"/status","chat":{"id":$chat_id,"type":"private"},"from":{"id":1,"first_name":"CI"}}}')")
+
+          echo "N8N webhook response: $RESP"
+          OK=$(echo "$RESP" | jq -r '.ok // empty')
+          [ "$OK" = "true" ] || { echo "::error::Unexpected webhook response: $RESP"; exit 1; }
+          echo "E2E PASSED — N8N processed /status and sent Telegram reply."
+
+      - name: Revoke CI API key
+        if: always()
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          KEY_ID: ${{ steps.n8n_auth.outputs.n8n_api_key_id }}
+        run: |
+          [ -z "$KEY_ID" ] && { echo "No API key ID captured — skipping revocation."; exit 0; }
+          curl -s -b /tmp/n8n_cookies.txt \
+            -X DELETE "$BASE_URL/rest/api-keys/$KEY_ID" > /dev/null
+          echo "CI API key $KEY_ID revoked."
+
+      - name: Summary
+        env:
+          CRED_ID: ${{ steps.credential.outputs.credential_id }}
+          WF_ID: ${{ steps.workflow.outputs.workflow_id }}
+          WEBHOOK_URL: ${{ steps.register_webhook.outputs.webhook_url }}
+        run: |
+          {
+            echo "## Stage 5 — Telegram Operator Interface Complete"
+            echo ""
+            echo "| Resource | Detail | Status |"
+            echo "|----------|--------|--------|"
+            echo "| N8N credential | \`Telegram Bot\` (telegramApi, ID: \`$CRED_ID\`) | ✅ |"
+            echo "| N8N workflow | \`Telegram Operator Interface\` (ID: \`$WF_ID\`) | ✅ Active |"
+            echo "| Telegram webhook | \`$WEBHOOK_URL\` | ✅ Registered |"
+            echo "| Command | \`/status\` → system health reply | ✅ |"
+            echo "| E2E gate | Simulated POST → N8N processes → Telegram reply | ✅ |"
+          } >> "$GITHUB_STEP_SUMMARY"

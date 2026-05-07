@@ -1,0 +1,375 @@
+name: Stage 2 — N8N Deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy N8N + PostgreSQL to Railway
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      N8N_OWNER_EMAIL: ${{ vars.N8N_OWNER_EMAIL }}
+      N8N_DOMAIN: ${{ vars.N8N_DOMAIN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch secrets from GCP Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            railway-api-token:${{ vars.GCP_PROJECT_ID }}/railway-api-token
+            n8n-admin-password-plaintext:${{ vars.GCP_PROJECT_ID }}/n8n-admin-password-plaintext
+            n8n-encryption-key:${{ vars.GCP_PROJECT_ID }}/n8n-encryption-key
+            railway-project-id:${{ vars.GCP_PROJECT_ID }}/railway-project-id
+            railway-environment-id:${{ vars.GCP_PROJECT_ID }}/railway-environment-id
+            cloudflare-api-token:${{ vars.GCP_PROJECT_ID }}/cloudflare-api-token
+            CLOUDFLARE_ZONE_ID:${{ vars.GCP_PROJECT_ID }}/CLOUDFLARE_ZONE_ID
+
+      - name: Export Railway project/environment IDs to env
+        run: |
+          echo "RAILWAY_PROJECT_ID=${{ steps.secrets.outputs.railway-project-id }}" >> "$GITHUB_ENV"
+          echo "RAILWAY_ENVIRONMENT_ID=${{ steps.secrets.outputs.railway-environment-id }}" >> "$GITHUB_ENV"
+
+      - name: Create PostgreSQL service (idempotent)
+        id: postgres
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+        run: |
+          RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){services{edges{node{id name}}}}}","variables":{"pid":$pid}}')")
+
+          PG_ID=$(echo "$RESP" | jq -r \
+            '[.data.project.services.edges[] | select(.node.name == "Postgres")] | first | .node.id // empty')
+
+          if [ -n "$PG_ID" ]; then
+            echo "Postgres service already exists: $PG_ID"
+          else
+            echo "Creating Postgres service..."
+            CREATE=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+              -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+                '{"query":"mutation($pid:String!){serviceCreate(input:{projectId:$pid,name:\"Postgres\",source:{image:\"ghcr.io/railwayapp-templates/postgres-ssl:17\"}}){id}}","variables":{"pid":$pid}}')") 
+            PG_ID=$(echo "$CREATE" | jq -r '.data.serviceCreate.id // empty')
+            echo "Created Postgres service: $PG_ID"
+          fi
+
+          [ -n "$PG_ID" ] || { echo "::error::Failed to resolve Postgres service ID"; exit 1; }
+          echo "postgres_id=$PG_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Attach PostgreSQL Volume (idempotent)
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+          PG_ID: ${{ steps.postgres.outputs.postgres_id }}
+        run: |
+          VOL_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){volumes{edges{node{id name}}}}}","variables":{"pid":$pid}}')")
+
+          VOL_COUNT=$(echo "$VOL_RESP" | jq '.data.project.volumes.edges | length')
+          if [ "${VOL_COUNT:-0}" -gt 0 ]; then
+            echo "Volume already attached (count: $VOL_COUNT) — skipping."
+          else
+            echo "Creating Railway volume for Postgres at /var/lib/postgresql/data..."
+            curl -s -X POST https://backboard.railway.com/graphql/v2 \
+              -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn \
+                --arg pid "$RAILWAY_PROJECT_ID" \
+                --arg sid "$PG_ID" \
+                --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+                '{"query":"mutation($i:VolumeCreateInput!){volumeCreate(input:$i){id name}}","variables":{"i":{"projectId":$pid,"serviceId":$sid,"environmentId":$eid,"mountPath":"/var/lib/postgresql/data"}}}')" \
+              | jq '{id: .data.volumeCreate.id, name: .data.volumeCreate.name}'
+          fi
+
+      - name: Configure PostgreSQL variables (idempotent)
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+          PG_ID: ${{ steps.postgres.outputs.postgres_id }}
+        run: |
+          VARS=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg sid "$PG_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+              --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($sid:String!,$eid:String!,$pid:String!){variables(serviceId:$sid,environmentId:$eid,projectId:$pid)}","variables":{"sid":$sid,"eid":$eid,"pid":$pid}}')")
+
+          PGPASS=$(echo "$VARS" | jq -r '.data.variables.POSTGRES_PASSWORD // empty')
+          PGDATA_EXISTING=$(echo "$VARS" | jq -r '.data.variables.PGDATA // empty')
+
+          if [ -n "$PGDATA_EXISTING" ]; then
+            echo "PostgreSQL variables already configured — skipping upsert to prevent redeploy."
+          else
+            if [ -z "$PGPASS" ]; then
+              PGPASS=$(openssl rand -hex 16)
+            fi
+            DOLLAR='$'
+            pids=()
+            upsert_var() {
+              local name="$1" value="$2"
+              curl -s -X POST https://backboard.railway.com/graphql/v2 \
+                -H "Authorization: Bearer $RAILWAY_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -cn \
+                  --arg pid "$RAILWAY_PROJECT_ID" \
+                  --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+                  --arg sid "$PG_ID" \
+                  --arg n "$name" \
+                  --arg v "$value" \
+                  '{"query":"mutation($i:VariableUpsertInput!){variableUpsert(input:$i)}","variables":{"i":{"projectId":$pid,"environmentId":$eid,"serviceId":$sid,"name":$n,"value":$v}}}')" > /dev/null
+            }
+            upsert_var "POSTGRES_DB"       "railway"                                                                              & pids+=($!)
+            upsert_var "POSTGRES_USER"     "postgres"                                                                             & pids+=($!)
+            upsert_var "POSTGRES_PASSWORD" "$PGPASS"                                                                              & pids+=($!)
+            upsert_var "PGDATA"            "/var/lib/postgresql/data/pgdata"                                                      & pids+=($!)
+            upsert_var "DATABASE_URL"      "postgresql://postgres:${DOLLAR}{{POSTGRES_PASSWORD}}@${DOLLAR}{{RAILWAY_PRIVATE_DOMAIN}}:5432/railway" & pids+=($!)
+            for pid in "${pids[@]}"; do wait "$pid" || exit 1; done
+            echo "PostgreSQL variables configured (first-time setup — redeploy expected once)."
+          fi
+
+      - name: Create N8N service (idempotent)
+        id: n8n
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+        run: |
+          RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){services{edges{node{id name}}}}}","variables":{"pid":$pid}}')")
+
+          N8N_ID=$(echo "$RESP" | jq -r \
+            '[.data.project.services.edges[] | select(.node.name == "n8n")] | first | .node.id // empty')
+
+          if [ -n "$N8N_ID" ]; then
+            echo "N8N service already exists: $N8N_ID"
+          else
+            echo "Creating N8N service..."
+            CREATE=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+              -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+                '{"query":"mutation($pid:String!){serviceCreate(input:{projectId:$pid,name:\"n8n\",source:{image:\"n8nio/n8n:latest\"}}){id}}","variables":{"pid":$pid}}')") 
+            N8N_ID=$(echo "$CREATE" | jq -r '.data.serviceCreate.id // empty')
+            echo "Created N8N service: $N8N_ID"
+          fi
+
+          [ -n "$N8N_ID" ] || { echo "::error::Failed to resolve N8N service ID"; exit 1; }
+          echo "n8n_id=$N8N_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Configure N8N environment variables
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+          N8N_BASIC_AUTH_PASSWORD: ${{ steps.secrets.outputs.n8n-admin-password-plaintext }}
+          N8N_ENCRYPTION_KEY: ${{ steps.secrets.outputs.n8n-encryption-key }}
+          N8N_ID: ${{ steps.n8n.outputs.n8n_id }}
+        run: |
+          VARS=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg sid "$N8N_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+              --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($sid:String!,$eid:String!,$pid:String!){variables(serviceId:$sid,environmentId:$eid,projectId:$pid)}","variables":{"sid":$sid,"eid":$eid,"pid":$pid}}')")
+
+          N8N_ENC_EXISTING=$(echo "$VARS" | jq -r '.data.variables.N8N_ENCRYPTION_KEY // empty')
+
+          if [ -n "$N8N_ENC_EXISTING" ]; then
+            echo "N8N variables already configured — skipping upsert to prevent redeploy."
+          else
+            upsert_var() {
+              local name="$1" value="$2"
+              curl -s -X POST https://backboard.railway.com/graphql/v2 \
+                -H "Authorization: Bearer $RAILWAY_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -cn \
+                  --arg pid "$RAILWAY_PROJECT_ID" \
+                  --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+                  --arg sid "$N8N_ID" \
+                  --arg n "$name" \
+                  --arg v "$value" \
+                  '{"query":"mutation($i:VariableUpsertInput!){variableUpsert(input:$i)}","variables":{"i":{"projectId":$pid,"environmentId":$eid,"serviceId":$sid,"name":$n,"value":$v}}}')" > /dev/null
+            }
+            DOLLAR='$'
+            pids=()
+            upsert_var "N8N_BASIC_AUTH_ACTIVE"   "true"                                   & pids+=($!)
+            upsert_var "N8N_BASIC_AUTH_USER"     "admin"                                  & pids+=($!)
+            upsert_var "N8N_BASIC_AUTH_PASSWORD" "$N8N_BASIC_AUTH_PASSWORD"               & pids+=($!)
+            upsert_var "N8N_ENCRYPTION_KEY"      "$N8N_ENCRYPTION_KEY"                    & pids+=($!)
+            upsert_var "DATABASE_TYPE"           "postgresdb"                             & pids+=($!)
+            upsert_var "DATABASE_URL"            "${DOLLAR}{{Postgres.DATABASE_URL}}"     & pids+=($!)
+            upsert_var "PORT"                    "5678"                                   & pids+=($!)
+            upsert_var "N8N_PORT"                "5678"                                   & pids+=($!)
+            upsert_var "N8N_HOST"                "0.0.0.0"                                & pids+=($!)
+            upsert_var "N8N_PROTOCOL"            "https"                                  & pids+=($!)
+            upsert_var "WEBHOOK_URL"             "https://$N8N_DOMAIN/"                   & pids+=($!)
+            for pid in "${pids[@]}"; do wait "$pid" || exit 1; done
+            echo "N8N variables configured (first-time setup — redeploy expected once)."
+          fi
+
+      - name: Configure domains for N8N on Railway (idempotent)
+        id: domain
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+          N8N_ID: ${{ steps.n8n.outputs.n8n_id }}
+        run: |
+          DOMAINS_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg sid "$N8N_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+              '{"query":"query($sid:String!,$eid:String!){serviceInstance(serviceId:$sid,environmentId:$eid){domains{customDomains{id domain}serviceDomains{id domain}}}}","variables":{"sid":$sid,"eid":$eid}}')")
+          echo "Current domains: $DOMAINS_RESP"
+
+          RAILWAY_DOMAIN=$(echo "$DOMAINS_RESP" | jq -r \
+            '(.data.serviceInstance.domains.serviceDomains // []) | .[0].domain // ""')
+
+          if [ -n "$RAILWAY_DOMAIN" ]; then
+            echo "Railway service domain already exists: $RAILWAY_DOMAIN"
+          else
+            echo "Creating Railway service domain (*.up.railway.app)..."
+            SD_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+              -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg sid "$N8N_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+                '{"query":"mutation($i:ServiceDomainCreateInput!){serviceDomainCreate(input:$i){id domain}}","variables":{"i":{"serviceId":$sid,"environmentId":$eid}}}')")
+            echo "serviceDomainCreate response: $SD_RESP"
+            RAILWAY_DOMAIN=$(echo "$SD_RESP" | jq -r '.data.serviceDomainCreate.domain // ""')
+          fi
+
+          if [ -z "$RAILWAY_DOMAIN" ]; then
+            echo "::error::Failed to obtain Railway service domain."
+            exit 1
+          fi
+          echo "Railway service domain: $RAILWAY_DOMAIN"
+
+          CUSTOM_EXISTS=$(echo "$DOMAINS_RESP" | jq -r --arg d "$N8N_DOMAIN" \
+            '[(.data.serviceInstance.domains.customDomains // [])[] | select(.domain == $d)] | length')
+
+          if [ "$CUSTOM_EXISTS" -gt 0 ]; then
+            echo "Custom domain $N8N_DOMAIN already registered."
+          else
+            echo "Creating custom domain $N8N_DOMAIN..."
+            CD_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+              -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg sid "$N8N_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" --arg domain "$N8N_DOMAIN" \
+                '{"query":"mutation($i:CustomDomainCreateInput!){customDomainCreate(input:$i){id domain}}","variables":{"i":{"domain":$domain,"serviceId":$sid,"environmentId":$eid}}}')")
+            echo "customDomainCreate response: $CD_RESP"
+          fi
+
+          echo "cname_target=$RAILWAY_DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Update Cloudflare DNS for N8N domain (idempotent)
+        env:
+          CLOUDFLARE_TOKEN: ${{ steps.secrets.outputs.cloudflare-api-token }}
+          CLOUDFLARE_ZONE_ID: ${{ steps.secrets.outputs.CLOUDFLARE_ZONE_ID }}
+          CNAME_TARGET: ${{ steps.domain.outputs.cname_target }}
+        run: |
+          EXISTING=$(curl -sf \
+            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$N8N_DOMAIN&type=CNAME" \
+            -H "Authorization: Bearer $CLOUDFLARE_TOKEN")
+
+          COUNT=$(echo "$EXISTING" | jq '.result | length')
+          RECORD_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
+
+          if [ "$COUNT" -gt 0 ] && [ -n "$RECORD_ID" ]; then
+            echo "Updating existing CNAME record $RECORD_ID → $CNAME_TARGET"
+            curl -sf -X PATCH \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer $CLOUDFLARE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$N8N_DOMAIN\",\"content\":\"$CNAME_TARGET\",\"ttl\":1,\"proxied\":false}" \
+              | jq '{success: .success, name: .result.name, content: .result.content}'
+          else
+            echo "Creating CNAME record $N8N_DOMAIN → $CNAME_TARGET"
+            curl -sf -X POST \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+              -H "Authorization: Bearer $CLOUDFLARE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$N8N_DOMAIN\",\"content\":\"$CNAME_TARGET\",\"ttl\":1,\"proxied\":false}" \
+              | jq '{success: .success, id: .result.id, name: .result.name}'
+          fi
+
+      - name: E2E — Wait for N8N /healthz/readiness
+        env:
+          RAILWAY_DOMAIN: ${{ steps.domain.outputs.cname_target }}
+        run: |
+          # Use Railway service domain directly to avoid DNS propagation delays
+          CHECK_URL="https://$RAILWAY_DOMAIN/healthz/readiness"
+          echo "Health check URL: $CHECK_URL"
+          for attempt in $(seq 1 20); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+              "$CHECK_URL" 2>/dev/null)
+            echo "Attempt $attempt/20: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "N8N is healthy."
+              break
+            fi
+            if [ "$attempt" = "20" ]; then
+              echo "::error::N8N health check failed after 20 attempts (10 minutes) at $CHECK_URL"
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: N8N Owner Account Setup (idempotent)
+        env:
+          RAILWAY_DOMAIN: ${{ steps.domain.outputs.cname_target }}
+          N8N_OWNER_PASSWORD: ${{ steps.secrets.outputs.n8n-admin-password-plaintext }}
+        run: |
+          BASE_URL="https://$RAILWAY_DOMAIN"
+          SETTINGS=$(curl -s --max-time 10 "$BASE_URL/rest/settings" || echo '{}')
+          NEEDS_SETUP=$(echo "$SETTINGS" | jq -r \
+            '.data.userManagement.showSetupOnFirstLoad // .userManagement.showSetupOnFirstLoad // "false"' \
+            2>/dev/null || echo "false")
+          echo "showSetupOnFirstLoad: $NEEDS_SETUP"
+          if [ "$NEEDS_SETUP" = "true" ]; then
+            echo "Creating N8N owner account..."
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+              -X POST "$BASE_URL/rest/owner/setup" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn \
+                --arg email "$N8N_OWNER_EMAIL" \
+                --arg pw "$N8N_OWNER_PASSWORD" \
+                '{"email":$email,"firstName":"Admin","lastName":"User","password":$pw,"agree":true}')")
+            echo "Owner setup response: HTTP $HTTP"
+            [ "$HTTP" = "200" ] || { echo "::error::N8N owner setup failed (HTTP $HTTP)"; exit 1; }
+            echo "N8N owner account created."
+          else
+            echo "N8N owner account already exists — skipping setup."
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## Stage 2 — N8N Deployment Complete"
+            echo ""
+            echo "| Resource | Status |"
+            echo "|----------|--------|"
+            echo "| PostgreSQL service (Railway) | ✅ |"
+            echo "| N8N service \`n8nio/n8n:latest\` (Railway) | ✅ |"
+            echo "| Custom domain \`$N8N_DOMAIN\` | ✅ |"
+            echo "| Cloudflare DNS CNAME (DNS-only) | ✅ |"
+            echo "| E2E gate \`/healthz/readiness\` → HTTP 200 | ✅ |"
+          } >> "$GITHUB_STEP_SUMMARY"

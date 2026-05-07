@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/DavidAnson/markdownlint/main/schema/markdownlint-config-schema.json",
+  "config": {
+    "default": true,
+
+    "MD013": false,
+    "MD041": false,
+    "MD024": false,
+    "MD033": false,
+    "MD036": false,
+    "MD040": false,
+
+    "MD060": false,
+    "MD032": false,
+    "MD034": false,
+    "MD022": false,
+    "MD031": false,
+    "MD009": false,
+    "MD007": false,
+    "MD025": false,
+    "MD047": false,
+    "MD049": false,
+    "MD012": false
+  },
+  "globs": ["**/*.md"],
+  "ignores": [
+    "node_modules/**",
+    "FINAL_SYNTHESIS_HANDOFF.md.md",
+    "deep-research-report*.md",
+    "internet_standards_research_*.md"
+  ]
+}

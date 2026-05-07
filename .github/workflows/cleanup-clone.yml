@@ -1,0 +1,166 @@
+name: Cleanup clone (delete repo + Railway project + GCP project)
+
+# One-shot cleanup utility. Deletes a GitHub repo, its Railway project, and GCP project.
+# Requires explicit dispatch — never runs automatically.
+# Uses Provisioner App token (administration:write) for repo deletion,
+# Railway account token from clone's SM for Railway deletion,
+# and WIF for GCP project deletion.
+#
+# Safety: inputs must be provided explicitly. No defaults that could
+# accidentally delete a production resource.
+
+on:
+  workflow_dispatch:
+    inputs:
+      github_repo:
+        description: 'GitHub repo to delete (owner/name, e.g. edri2or/test-agent-06)'
+        required: true
+      gcp_project_id:
+        description: 'GCP project ID to delete (e.g. or-test-agent-06)'
+        required: true
+      confirm:
+        description: 'Type "DELETE" to confirm'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cleanup:
+    name: Delete ${{ inputs.github_repo }} + ${{ inputs.gcp_project_id }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
+            echo "::error::Confirmation must be exactly 'DELETE'. Got: ${{ inputs.confirm }}"
+            exit 1
+          fi
+          echo "::notice::Confirmed — proceeding with deletion of ${{ inputs.github_repo }} + ${{ inputs.gcp_project_id }}"
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Delete GitHub repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ inputs.github_repo }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$REPO" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$REPO"
+            echo "::notice::Deleted GitHub repo $REPO"
+          else
+            echo "::notice::Repo $REPO not found — already deleted or never created (skipping)"
+          fi
+
+      - name: Delete Railway project
+        env:
+          CLONE_PROJECT: ${{ inputs.gcp_project_id }}
+        run: |
+          set -euo pipefail
+          # Read railway-project-id and railway-api-token from the clone's SM.
+          # The template-builder SA has secretmanager.admin on clone projects (granted by grant-autonomy.sh).
+          RAILWAY_PROJECT_ID="$(gcloud secrets versions access latest \
+            --secret=railway-project-id --project="$CLONE_PROJECT" 2>/dev/null || echo "")"
+          RAILWAY_API_TOKEN="$(gcloud secrets versions access latest \
+            --secret=railway-api-token --project="$CLONE_PROJECT" 2>/dev/null || echo "")"
+
+          if [[ -z "$RAILWAY_PROJECT_ID" ]]; then
+            echo "::notice::railway-project-id not found in $CLONE_PROJECT SM — Railway project was never created or already cleaned up (skipping)"
+            echo "## Railway: no project ID found — skipped" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ -z "$RAILWAY_API_TOKEN" ]]; then
+            echo "::warning::railway-api-token not found in $CLONE_PROJECT SM — cannot delete Railway project $RAILWAY_PROJECT_ID (manual cleanup required)"
+            echo "## ⚠ Railway project \`$RAILWAY_PROJECT_ID\`: token missing — manual cleanup required" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          RESPONSE=$(curl -s -X POST "https://backboard.railway.app/graphql/v2" \
+            -H "Authorization: Bearer $RAILWAY_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -H "User-Agent: autonomous-agent-template-builder/1.0 (+cleanup-clone.yml)" \
+            -d "{\"query\":\"mutation { projectDelete(id: \\\"$RAILWAY_PROJECT_ID\\\") }\"}")
+
+          if echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('data',{}).get('projectDelete') else 1)" 2>/dev/null; then
+            echo "::notice::Deleted Railway project $RAILWAY_PROJECT_ID"
+            echo "## Railway project \`$RAILWAY_PROJECT_ID\` deleted" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Railway projectDelete returned unexpected response: $(echo "$RESPONSE" | head -c 400)"
+            echo "## ⚠ Railway project \`$RAILWAY_PROJECT_ID\`: unexpected response — may need manual cleanup" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Delete GCP project
+        env:
+          PROJECT: ${{ inputs.gcp_project_id }}
+        run: |
+          set -euo pipefail
+          STATE=$(gcloud projects describe "$PROJECT" --format='value(lifecycleState)' 2>/dev/null || echo "NOT_FOUND")
+          case "$STATE" in
+            ACTIVE)
+              DELETE_OUT=$(gcloud projects delete "$PROJECT" --quiet 2>&1) || {
+                rc=$?
+                printf '::error::gcloud projects delete %s failed (exit %s): %s\n' "$PROJECT" "$rc" "$DELETE_OUT"
+                {
+                  echo "## GCP project deletion FAILED"
+                  echo "- Project: \`$PROJECT\`"
+                  echo "- Exit code: \`$rc\`"
+                  echo '```'
+                  echo "$DELETE_OUT"
+                  echo '```'
+                  echo "### IAM policy"
+                  gcloud projects get-iam-policy "$PROJECT" --format=json 2>&1 || echo "(could not read IAM policy)"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit "$rc"
+              }
+              echo "::notice::Deleted GCP project $PROJECT"
+              echo "## GCP project deleted: \`$PROJECT\`" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            DELETE_REQUESTED)
+              # Already in 30-day deletion queue — idempotent success.
+              echo "::notice::GCP project $PROJECT is already in DELETE_REQUESTED state — already queued for deletion (idempotent)"
+              echo "## GCP project \`$PROJECT\`: already DELETE_REQUESTED (idempotent)" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            NOT_FOUND)
+              echo "::notice::GCP project $PROJECT not found — already deleted or never created (skipping)"
+              ;;
+            *)
+              printf '::error::Unexpected project lifecycleState for %s: %s\n' "$PROJECT" "$STATE"
+              exit 1
+              ;;
+          esac
+
+      - name: Summary
+        run: |
+          {
+            echo "## Cleanup complete"
+            echo ""
+            echo "- GitHub repo: \`${{ inputs.github_repo }}\` — deleted (or not found)"
+            echo "- Railway project: see above"
+            echo "- GCP project: \`${{ inputs.gcp_project_id }}\` — deleted (or not found)"
+          } >> "$GITHUB_STEP_SUMMARY"

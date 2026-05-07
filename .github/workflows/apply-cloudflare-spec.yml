@@ -1,0 +1,246 @@
+name: Apply Cloudflare spec (ADR-0013)
+
+# Per ADR-0013: spec-driven Cloudflare provisioner. Reads
+# `spec.cloudflare.{zone, worker.{name, route}}` from a SystemSpec
+# YAML and:
+#   1. Resolves zone → zoneId via Cloudflare REST API.
+#   2. Writes spec-derived values to the target clone's GCP
+#      Secret Manager (`spec.gcp.projectId`, ADR-0010 boundary):
+#        cloudflare-zone-id
+#        cloudflare-worker-name
+#        cloudflare-worker-route
+#
+# What this workflow does NOT do (intentional v0 scope):
+#   - Worker script deployment — owned by `deploy.yml` in the clone
+#     repo via wrangler-action (R-01 — Cloudflare lacks native OIDC for
+#     Workers CI; using API token from GCP Secret Manager).
+#   - Workers Route binding — created by wrangler at deploy time once
+#     the script exists; creating it here would dangle until the script
+#     ships.
+#   - DNS records — managed by `terraform/cloudflare.tf` in the clone.
+#
+# Idempotent. Read-only against Cloudflare; mutates only the target
+# clone's GCP Secret Manager.
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec_path:
+        description: 'Spec file path relative to repo root (e.g. specs/hello-world-agent.yaml)'
+        required: true
+        default: 'specs/hello-world-agent.yaml'
+  pull_request:
+    paths:
+      - '.github/workflows/apply-cloudflare-spec.yml'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    name: Provision Cloudflare from spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Validation gated on workflow_dispatch — parent apply-system-spec.yml
+      # has already validated the spec, and PR self-register only emits a
+      # notice. Saves ~40s/PR.
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci --silent
+        if: github.event_name == 'workflow_dispatch'
+
+      - name: Validate spec against system-spec.v1.json
+        if: github.event_name == 'workflow_dispatch'
+        run: npm run test:docs
+
+      - name: Parse spec fields
+        id: parse
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SPEC_PATH: ${{ inputs.spec_path }}
+        run: |
+          node <<'JSEOF'
+          const { readFileSync, appendFileSync } = require("node:fs");
+          const yaml = require("js-yaml");
+          const path = process.env.SPEC_PATH;
+          const doc = yaml.load(readFileSync(path, "utf8"));
+          const { spec, metadata } = doc;
+          const cf = spec.cloudflare || {};
+          const worker = cf.worker || {};
+          const out = process.env.GITHUB_OUTPUT;
+          appendFileSync(out, "spec_name="       + metadata.name        + "\n");
+          appendFileSync(out, "gcp_project_id="  + spec.gcp.projectId   + "\n");
+          appendFileSync(out, "zone="            + (cf.zone     || "") + "\n");
+          appendFileSync(out, "worker_name="     + (worker.name || "") + "\n");
+          appendFileSync(out, "worker_route="    + (worker.route|| "") + "\n");
+          appendFileSync(out, "has_cloudflare="  + ("cloudflare" in spec ? "true" : "false") + "\n");
+          JSEOF
+
+      - name: Authenticate to GCP (WIF)
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_cloudflare == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_cloudflare == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Use google-github-actions/get-secretmanager-secrets@v2 instead of
+      # inline `gcloud secrets versions access` — the inline path leaves a
+      # trailing newline on the captured value which then propagates into
+      # the `Authorization: Bearer <token>\n` header, triggering Cloudflare
+      # error 9109 "Invalid access token" (observed live in run 25254594258).
+      # The action handles trimming + masking automatically and is the same
+      # pattern used by provision-new-clone.yml for gh-admin-token.
+      - name: Read Cloudflare API token from GCP Secret Manager
+        id: cf-token
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_cloudflare == 'true'
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            value:${{ vars.GCP_PROJECT_ID }}/cloudflare-api-token
+
+      - name: Resolve zone → zoneId via Cloudflare API
+        id: resolve
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_cloudflare == 'true'
+        env:
+          CF_API_TOKEN: ${{ steps.cf-token.outputs.value }}
+          ZONE:         ${{ steps.parse.outputs.zone }}
+          WORKER_NAME:  ${{ steps.parse.outputs.worker_name }}
+          WORKER_ROUTE: ${{ steps.parse.outputs.worker_route }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, sys, urllib.parse, urllib.request, urllib.error
+
+          token        = os.environ["CF_API_TOKEN"]
+          zone_name    = os.environ["ZONE"]
+          worker_name  = os.environ["WORKER_NAME"]
+          worker_route = os.environ["WORKER_ROUTE"]
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          output_path  = os.environ["GITHUB_OUTPUT"]
+
+          def w(line=""):
+            with open(summary_path, "a") as f:
+              f.write(line + "\n")
+
+          def out(name, value):
+            with open(output_path, "a") as f:
+              f.write(f"{name}={value}\n")
+
+          if not zone_name:
+            w("## ❌ spec.cloudflare.zone is empty")
+            print("::error title=Cloudflare spec missing zone::spec.cloudflare.zone is required")
+            sys.exit(1)
+
+          HEADERS = {
+            "Authorization": f"Bearer {token}",
+            "Accept":        "application/json",
+            "User-Agent":    "autonomous-agent-template-builder/1.0 (+apply-cloudflare-spec.yml)",
+          }
+
+          def cf_zone_lookup(name):
+            url = "https://api.cloudflare.com/client/v4/zones?" + urllib.parse.urlencode({"name": name})
+            req = urllib.request.Request(url, headers=HEADERS)
+            try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+              err = e.read().decode("utf-8", "replace")
+              w(f"## ❌ Cloudflare API error {e.code} (lookup `{name}`)")
+              w("```"); w(err[:2000]); w("```")
+              print(f"::error title=Cloudflare API {e.code}::{err[:1500].replace(chr(10),' ')}")
+              sys.exit(1)
+
+          # Cloudflare GET /zones?name=<zone> matches an apex zone exactly.
+          # Subdomains in the spec resolve to the registered apex zone the
+          # operator owns by walking up labels until one matches.
+          body = cf_zone_lookup(zone_name)
+          if not body.get("success"):
+            w("## ❌ Cloudflare zone lookup failed")
+            w("```json"); w(json.dumps(body, indent=2)[:2000]); w("```")
+            print("::error title=Cloudflare zone lookup failed::see step summary")
+            sys.exit(1)
+
+          results = body.get("result") or []
+          zone_id = None
+          if results:
+            zone_id = results[0]["id"]
+          else:
+            labels = zone_name.split(".")
+            for i in range(1, len(labels) - 1):
+              parent = ".".join(labels[i:])
+              body = cf_zone_lookup(parent)
+              if body.get("success") and body.get("result"):
+                zone_id = body["result"][0]["id"]
+                w(f"- Spec zone `{zone_name}` is a subdomain; resolved to apex `{parent}` (id `{zone_id}`).")
+                break
+
+          if not zone_id:
+            w(f"## ❌ No Cloudflare zone matches `{zone_name}` (or any apex parent)")
+            print(f"::error title=Cloudflare zone not found::{zone_name}")
+            sys.exit(1)
+
+          w("# Cloudflare provision (spec-driven) — ADR-0013")
+          w()
+          w(f"- Spec zone:    `{zone_name}`")
+          w(f"- Resolved id:  `{zone_id}`")
+          w(f"- Worker name:  `{worker_name or '—'}`")
+          w(f"- Worker route: `{worker_route or '—'}`")
+          w()
+
+          out("zone_id", zone_id)
+          print(f"::notice::Cloudflare zone resolved {zone_name}={zone_id}")
+          PYEOF
+
+      - name: Write IDs to target clone's GCP Secret Manager
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_cloudflare == 'true'
+        env:
+          TARGET_GCP_PROJECT_ID: ${{ steps.parse.outputs.gcp_project_id }}
+          ZONE_ID:               ${{ steps.resolve.outputs.zone_id }}
+          WORKER_NAME:           ${{ steps.parse.outputs.worker_name }}
+          WORKER_ROUTE:          ${{ steps.parse.outputs.worker_route }}
+        run: |
+          set -euo pipefail
+          upsert_secret() {
+            local name="$1" value="$2"
+            if [[ -z "$value" ]]; then
+              echo "::warning::Empty value for $name — skipping"
+              return
+            fi
+            gcloud secrets create "$name" --project="$TARGET_GCP_PROJECT_ID" --replication-policy=automatic 2>/dev/null || true
+            printf '%s' "$value" | gcloud secrets versions add "$name" --project="$TARGET_GCP_PROJECT_ID" --data-file=- >/dev/null
+            echo "✅ $name written to project $TARGET_GCP_PROJECT_ID"
+          }
+          upsert_secret cloudflare-zone-id      "$ZONE_ID"
+          upsert_secret cloudflare-worker-name  "$WORKER_NAME"
+          upsert_secret cloudflare-worker-route "$WORKER_ROUTE"
+
+          {
+            echo
+            echo "## GCP Secret Manager — Cloudflare IDs (target project \`$TARGET_GCP_PROJECT_ID\`)"
+            echo
+            echo "| Secret | Length |"
+            echo "|--------|--------|"
+            echo "| \`cloudflare-zone-id\`      | ${#ZONE_ID} |"
+            echo "| \`cloudflare-worker-name\`  | ${#WORKER_NAME} |"
+            echo "| \`cloudflare-worker-route\` | ${#WORKER_ROUTE} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: PR self-register notice
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "## apply-cloudflare-spec.yml — PR self-register"
+            echo ""
+            echo "PR-triggered run is probe-only. No Cloudflare API calls, no Secret writes."
+            echo "Dispatch with \`spec_path\` to provision."
+          } >> "$GITHUB_STEP_SUMMARY"

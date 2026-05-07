@@ -1,0 +1,577 @@
+name: Apply system spec (ADR-0013)
+
+# Per ADR-0013 (Accepted): spec-driven provisioner.
+#
+# On pull_request (specs/, schemas/, or this file):
+#   validate-only — runs JSON-Schema validation against every spec in specs/;
+#   no mutations, no WIF auth required.
+#
+# On workflow_dispatch with spec_path:
+#   full provision in this DAG (provision-clone must finish before the
+#   provider workflows touch the target clone's GCP Secret Manager —
+#   the project doesn't exist until provision-new-clone.yml lands):
+#
+#     validate ──▶ provision-clone ──┬─▶ provision-providers
+#                                    └─▶ activate-clone
+#
+#   provision-clone calls provision-new-clone.yml as a reusable workflow
+#   (workflow_call) so this job blocks until the GCP project + GitHub
+#   repo are up. provision-providers fires the Railway + Cloudflare
+#   sub-workflow dispatches. activate-clone fires bootstrap.yml inside
+#   the new repo (Path D step 2 — mints n8n + openrouter-runtime secrets).
+#   Provider sub-workflows + bootstrap.yml all run async after dispatch;
+#   live monitoring via GitHub Actions UI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec_path:
+        description: 'Spec file path relative to repo root (e.g. specs/hello-world-agent.yaml)'
+        required: true
+        default: 'specs/hello-world-agent.yaml'
+  pull_request:
+    paths:
+      - 'specs/**'
+      - 'schemas/system-spec.v1.json'
+      - '.github/workflows/apply-system-spec.yml'
+      - '.github/workflows/provision-new-clone.yml'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    name: Validate + parse spec
+    runs-on: ubuntu-latest
+    outputs:
+      spec_name:            ${{ steps.parse.outputs.spec_name }}
+      gcp_project_id:       ${{ steps.parse.outputs.gcp_project_id }}
+      gcp_region:           ${{ steps.parse.outputs.gcp_region }}
+      github_repo:          ${{ steps.parse.outputs.github_repo }}
+      github_from_template: ${{ steps.parse.outputs.github_from_template }}
+      github_owner:         ${{ steps.parse.outputs.github_owner }}
+      has_railway:          ${{ steps.parse.outputs.has_railway }}
+      has_cloudflare:       ${{ steps.parse.outputs.has_cloudflare }}
+      repo_name:            ${{ steps.parse.outputs.repo_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci --silent
+
+      - name: Validate specs against system-spec.v1.json
+        run: npm run test:docs
+
+      - name: Parse spec fields
+        id: parse
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SPEC_PATH: ${{ inputs.spec_path }}
+        run: node scripts/parse-spec.js
+
+  provision-clone:
+    name: Provision GCP + GitHub (reusable provision-new-clone.yml)
+    needs: validate
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/provision-new-clone.yml
+    with:
+      new_repo_name:  ${{ needs.validate.outputs.repo_name }}
+      new_project_id: ${{ needs.validate.outputs.gcp_project_id }}
+      github_owner:   ${{ needs.validate.outputs.github_owner }}
+    secrets: inherit
+
+  provision-providers:
+    name: Provision Railway + Cloudflare (sub-workflow dispatches)
+    needs: [validate, provision-clone]
+    if: github.event_name == 'workflow_dispatch' && (needs.validate.outputs.has_railway == 'true' || needs.validate.outputs.has_cloudflare == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      actions: write   # required for gh workflow run (dispatching sub-workflows)
+    env:
+      HAS_RAILWAY:    ${{ needs.validate.outputs.has_railway }}
+      HAS_CLOUDFLARE: ${{ needs.validate.outputs.has_cloudflare }}
+      SPEC_PATH:      ${{ inputs.spec_path }}
+      SPEC_NAME:      ${{ needs.validate.outputs.spec_name }}
+    steps:
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+            cloudflare-api-token:${{ vars.GCP_PROJECT_ID }}/cloudflare-api-token
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Verify spec exists on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/${{ github.repository }}/contents/$SPEC_PATH" \
+              &>/dev/null 2>&1; then
+            echo "::error::Spec '$SPEC_PATH' not found on main branch. Sub-workflows always run against main — merge your branch first."
+            exit 1
+          fi
+          echo "✅ Spec '$SPEC_PATH' confirmed on main."
+
+      - name: Validate Cloudflare token
+        if: env.HAS_CLOUDFLARE == 'true'
+        env:
+          CF_TOKEN: ${{ steps.provisioner.outputs.cloudflare-api-token }}
+        run: |
+          set -euo pipefail
+          HTTP=$(curl -sS -o /tmp/cf_verify.json -w "%{http_code}" \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/user/tokens/verify")
+          SUCCESS=$(jq -r '.success' /tmp/cf_verify.json 2>/dev/null || echo false)
+          if [ "$HTTP" != "200" ] || [ "$SUCCESS" != "true" ]; then
+            echo "::error::cloudflare-api-token invalid (HTTP=$HTTP success=$SUCCESS). Rotate via rotate-cloudflare-token.yml before re-running."
+            cat /tmp/cf_verify.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ Cloudflare token valid."
+
+      - name: Dispatch apply-railway-spec.yml
+        if: env.HAS_RAILWAY == 'true'
+        env:
+          # Use GITHUB_TOKEN (has actions:write via job permissions) for dispatch.
+          # The Provisioner App token lacks actions:write (workflow:write ≠ actions:write).
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Railway services"
+            echo ""
+            echo "Dispatching \`apply-railway-spec.yml\` for spec \`$SPEC_NAME\` (\`$SPEC_PATH\`)."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RAILWAY_BEFORE_TS=$(date -u +%s)" >> "$GITHUB_ENV"
+          gh workflow run apply-railway-spec.yml \
+            --repo "${{ github.repository }}" \
+            --raw-field spec_path="$SPEC_PATH" 2>&1 | tee /tmp/gh_railway.log || {
+              echo "::error::gh workflow run apply-railway-spec.yml failed:"
+              cat /tmp/gh_railway.log >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            }
+          echo "::notice::Dispatched apply-railway-spec.yml for $SPEC_NAME"
+
+      - name: Dispatch apply-cloudflare-spec.yml
+        if: env.HAS_CLOUDFLARE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Cloudflare worker"
+            echo ""
+            echo "Dispatching \`apply-cloudflare-spec.yml\` for spec \`$SPEC_NAME\` (\`$SPEC_PATH\`)."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "CF_BEFORE_TS=$(date -u +%s)" >> "$GITHUB_ENV"
+          gh workflow run apply-cloudflare-spec.yml \
+            --repo "${{ github.repository }}" \
+            --raw-field spec_path="$SPEC_PATH" 2>&1 | tee /tmp/gh_cloudflare.log || {
+              echo "::error::gh workflow run apply-cloudflare-spec.yml failed:"
+              cat /tmp/gh_cloudflare.log >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            }
+          echo "::notice::Dispatched apply-cloudflare-spec.yml for $SPEC_NAME"
+
+      - name: Poll Railway + Cloudflare sub-workflows to completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+
+          poll_run() {
+            local label="$1" wf_name_pattern="$2" before_ts="$3"
+            local RUN_ID=""
+            for delay in 5 8 12 15 20 30; do
+              sleep "$delay"
+              RUN_ID=$(gh api "repos/$REPO/actions/runs?event=workflow_dispatch&per_page=10" \
+                --jq "[.workflow_runs[] | select(.name | test(\"$wf_name_pattern\")) | select((.created_at | fromdateiso8601) > $before_ts)] | first | .id | tostring" \
+                2>/dev/null || true)
+              [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] && break
+              RUN_ID=""
+            done
+            if [ -z "$RUN_ID" ]; then
+              echo "::warning::Could not capture run ID for $label — sub-workflow may still be running"
+              return 0
+            fi
+            echo "::notice::$label run ID: $RUN_ID — polling to completion (max 15 min)"
+            local STATUS="" CONCLUSION="" empty_streak=0
+            for ((attempt=1; attempt<=60; attempt++)); do
+              local DATA
+              DATA=$(gh api "repos/$REPO/actions/runs/$RUN_ID" 2>/dev/null || true)
+              if [ -z "$DATA" ]; then
+                empty_streak=$((empty_streak+1))
+                [ $((empty_streak % 5)) -eq 0 ] && echo "::warning::$label poll: $empty_streak consecutive empty API responses"
+                sleep 15; continue
+              fi
+              empty_streak=0
+              read -r STATUS CONCLUSION <<< "$(printf '%s' "$DATA" | python3 -c \
+                "import json,sys; d=json.load(sys.stdin); print(d.get('status',''), d.get('conclusion') or '')" \
+                2>/dev/null || echo ' ')"
+              [ "$STATUS" = "completed" ] && break
+              [ $((attempt % 8)) -eq 0 ] && echo "::notice::$label — still running (attempt $attempt/60)"
+              sleep 15
+            done
+            if [ "$CONCLUSION" != "success" ]; then
+              echo "::error::$label finished with conclusion=$CONCLUSION (run $RUN_ID)"
+              echo "## ❌ $label — conclusion: $CONCLUSION (run $RUN_ID)" >> "$GITHUB_STEP_SUMMARY"
+              return 1
+            fi
+            echo "::notice::✅ $label succeeded (run $RUN_ID)"
+            echo "## ✅ $label — succeeded (run $RUN_ID)" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          RAILWAY_PID="" CF_PID=""
+          if [ "${HAS_RAILWAY}" = "true" ] && [ -n "${RAILWAY_BEFORE_TS:-}" ]; then
+            poll_run "apply-railway-spec.yml" "Apply Railway spec" "$RAILWAY_BEFORE_TS" &
+            RAILWAY_PID=$!
+          fi
+          if [ "${HAS_CLOUDFLARE}" = "true" ] && [ -n "${CF_BEFORE_TS:-}" ]; then
+            poll_run "apply-cloudflare-spec.yml" "Apply Cloudflare spec" "$CF_BEFORE_TS" &
+            CF_PID=$!
+          fi
+          FAILED=0
+          [ -n "$RAILWAY_PID" ] && wait "$RAILWAY_PID" || FAILED=1
+          [ -n "$CF_PID" ]      && wait "$CF_PID"      || FAILED=1
+          [ "$FAILED" -eq 1 ] && exit 1
+
+  activate-clone:
+    name: Activate clone — dispatch bootstrap.yml in the new repo (Path D step 2)
+    needs: [validate, provision-clone, provision-providers]
+    # provision-providers is skipped for specs with no railway/cloudflare section;
+    # treat skipped as success so activate-clone still runs in that case.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (needs.provision-providers.result == 'success' ||
+       needs.provision-providers.result == 'skipped')
+    runs-on: ubuntu-latest
+    # Path D from docs/runbooks/bootstrap.md has 5 steps. Step 1 (set
+    # Variables) is done by grant-autonomy.sh inside provision-clone.
+    # Step 2 (dispatch bootstrap.yml — mints n8n + openrouter-runtime
+    # secrets) is autonomous-friendly and lives here. Steps 3-5 are
+    # vendor floors (R-04 Telegram tap, R-07 GitHub App 2 clicks, R-10
+    # Linear pool/silo) and remain operator-side per ADR-0007.
+    #
+    # Strategy: fire-and-forget with run URL surfaced. bootstrap.yml is
+    # idempotent (Phase 1 appends GSM secret versions; Phase 4 skips
+    # already-set github-app-* secrets), so re-dispatch is safe.
+    steps:
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Set APP_NAME variable in clone repo (backstop)
+        continue-on-error: true
+        env:
+          GH_TOKEN:  ${{ steps.app-token.outputs.token }}
+          OWNER:     ${{ needs.validate.outputs.github_owner }}
+          REPO:      ${{ needs.validate.outputs.repo_name }}
+          SPEC_NAME: ${{ needs.validate.outputs.spec_name }}
+        run: |
+          set -euo pipefail
+          # apply-railway-spec.yml sets APP_NAME=spec_name when Railway is in the spec.
+          # This backstop covers specs with no railway section and guards against the
+          # Railway domain timing issue that previously caused the variable to be skipped.
+          # Uses spec_name (not repo_name-app) to match apply-railway-spec.yml convention.
+          APP_NAME="${SPEC_NAME}"
+          # POST creates; PATCH updates if already exists (idempotent).
+          if ! gh api "repos/$OWNER/$REPO/actions/variables" \
+              --method POST -f name=APP_NAME -f value="$APP_NAME" 2>/dev/null; then
+            gh api "repos/$OWNER/$REPO/actions/variables/APP_NAME" \
+              --method PATCH -f value="$APP_NAME"
+          fi
+          echo "::notice::APP_NAME=$APP_NAME set in $OWNER/$REPO — bootstrap Phase 4 will now run"
+
+      - name: Fetch n8n Railway domain and set WEBHOOK_URL in clone repo
+        env:
+          GH_TOKEN:            ${{ steps.app-token.outputs.token }}
+          OWNER:               ${{ needs.validate.outputs.github_owner }}
+          REPO:                ${{ needs.validate.outputs.repo_name }}
+          SPEC_NAME:           ${{ needs.validate.outputs.spec_name }}
+          BUILDER_GCP_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Issue 13 fix: read builder's own railway-api-token from builder's SM
+          # (always present, no dependency on apply-railway-spec.yml finishing).
+          # Previous approach polled clone's SM for 5 min — insufficient because
+          # apply-railway-spec takes >5 min to write secrets there.
+          RAILWAY_TOKEN=$(gcloud secrets versions access latest \
+            --secret=railway-api-token --project="$BUILDER_GCP_PROJECT" 2>/dev/null || echo "")
+
+          if [[ -z "$RAILWAY_TOKEN" ]]; then
+            echo "::warning::railway-api-token not found in builder SM — skipping WEBHOOK_URL"
+            exit 0
+          fi
+
+          # Poll Railway API directly for the project named spec_name, then get/create
+          # the n8n service domain. 30 × 30s = up to 15 min timeout.
+          export RAILWAY_TOKEN SPEC_NAME
+          DOMAIN=$(python3 - <<'PYEOF'
+          import json, os, sys, time, urllib.request
+
+          token     = os.environ["RAILWAY_TOKEN"]
+          spec_name = os.environ["SPEC_NAME"]
+          GRAPHQL   = "https://backboard.railway.app/graphql/v2"
+          HEADERS   = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "autonomous-agent-template-builder/1.0 (+apply-system-spec.yml)",
+          }
+
+          def gql(query, variables=None):
+            payload = {"query": query}
+            if variables:
+              payload["variables"] = variables
+            req = urllib.request.Request(GRAPHQL,
+              data=json.dumps(payload).encode(), headers=HEADERS, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as r:
+              return json.loads(r.read())
+
+          # Railway GraphQL uses edges/node (Relay Connection), not nodes.
+          # Workspaces are a flat list, not a Connection.
+          PROJ_FRAG = "id name services { edges { node { id name } } } environments { edges { node { id } } }"
+
+          for attempt in range(1, 31):
+            try:
+              body = gql("""
+                query {
+                  me {
+                    projects { edges { node { %s } } }
+                    workspaces { id name projects { edges { node { %s } } } }
+                  }
+                }""".format(PROJ_FRAG, PROJ_FRAG))
+              me = (body.get("data") or {}).get("me") or {}
+              all_projects = {}
+              for edge in (me.get("projects") or {}).get("edges") or []:
+                p = edge["node"]
+                all_projects.setdefault(p["id"], p)
+              for ws in me.get("workspaces") or []:
+                for edge in (ws.get("projects") or {}).get("edges") or []:
+                  p = edge["node"]
+                  all_projects.setdefault(p["id"], p)
+              projects = list(all_projects.values())
+
+              project = next((p for p in projects if p.get("name") == spec_name), None)
+              if not project:
+                print(f"attempt {attempt}: project '{spec_name}' not found yet", file=sys.stderr)
+                if attempt < 30: time.sleep(30)
+                continue
+
+              proj_id = project["id"]
+              env_edges = (project.get("environments") or {}).get("edges") or []
+              env_id    = env_edges[0]["node"]["id"] if env_edges else ""
+              services  = [(e["node"]["name"], e["node"]["id"])
+                           for e in (project.get("services") or {}).get("edges") or []]
+              n8n_svc = next(((n, i) for n, i in services if n == "n8n"), None)
+              if not n8n_svc:
+                print(f"attempt {attempt}: n8n service not yet created", file=sys.stderr)
+                if attempt < 30: time.sleep(30)
+                continue
+
+              _, svc_id = n8n_svc
+              dom_body = gql("""
+                query($projectId:String!,$environmentId:String!,$serviceId:String!){
+                  domains(projectId:$projectId,environmentId:$environmentId,serviceId:$serviceId){
+                    serviceDomains { domain }
+                  }
+                }""", {"projectId": proj_id, "environmentId": env_id, "serviceId": svc_id})
+              existing = ((dom_body.get("data") or {}).get("domains") or {}).get("serviceDomains") or []
+              if existing:
+                print(existing[0]["domain"])
+                sys.exit(0)
+
+              create_body = gql("""
+                mutation($input:ServiceDomainCreateInput!){
+                  serviceDomainCreate(input:$input){ domain }
+                }""", {"input": {"serviceId": svc_id, "environmentId": env_id}})
+              domain = ((create_body.get("data") or {}).get("serviceDomainCreate") or {}).get("domain", "")
+              if domain:
+                print(domain)
+                sys.exit(0)
+
+              print(f"attempt {attempt}: domain creation returned empty", file=sys.stderr)
+              if attempt < 30: time.sleep(30)
+            except Exception as e:
+              print(f"attempt {attempt}: error — {e}", file=sys.stderr)
+              if attempt < 30: time.sleep(30)
+          # All attempts exhausted — fall through to empty DOMAIN check below.
+          PYEOF
+          ) || true   # never block bootstrap if domain poll fails
+
+          if [[ -z "$DOMAIN" ]]; then
+            echo "::warning::Could not resolve Railway n8n domain after 15 min — WEBHOOK_URL not set; apply-railway-spec.yml may have set it already"
+            exit 0
+          fi
+
+          WEBHOOK_URL="https://${DOMAIN}/webhook/github"
+          if ! gh api "repos/$OWNER/$REPO/actions/variables" \
+              --method POST -f name=WEBHOOK_URL -f value="$WEBHOOK_URL" 2>/dev/null; then
+            gh api "repos/$OWNER/$REPO/actions/variables/WEBHOOK_URL" \
+              --method PATCH -f value="$WEBHOOK_URL" 2>/dev/null || {
+              echo "::warning::WEBHOOK_URL variable set failed — Provisioner App likely lacks variables:write. Grant permission at github.com/organizations/${{ github.repository_owner }}/settings/apps to fix."
+              exit 0
+            }
+          fi
+          echo "::notice::WEBHOOK_URL=$WEBHOOK_URL set in $OWNER/$REPO"
+
+      - name: Dispatch bootstrap.yml in the clone and poll to completion
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER:    ${{ needs.validate.outputs.github_owner }}
+          REPO:     ${{ needs.validate.outputs.repo_name }}
+        run: |
+          set -euo pipefail
+          # Use repository_dispatch (requires contents:write — Provisioner App has
+          # this) instead of workflow_dispatch (requires actions:write — App lacks
+          # it). bootstrap.yml listens to repository_dispatch type "bootstrap".
+          if ! gh api "repos/$OWNER/$REPO/dispatches" \
+              --method POST \
+              -f event_type=bootstrap \
+              2>/tmp/dispatch.err; then
+            BODY=$(cat /tmp/dispatch.err 2>/dev/null || true)
+            printf '::error::repository_dispatch to %s/%s failed: %s\n' \
+              "$OWNER" "$REPO" "$BODY"
+            {
+              echo "## ❌ activate-clone: bootstrap repository_dispatch failed"
+              echo "- Body: \`$BODY\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "::notice::repository_dispatch sent to $OWNER/$REPO"
+
+          # Capture the bootstrap run ID (requires actions:read on Provisioner App).
+          # If the App lacks actions:read the poll silently skips — add "actions":"read"
+          # to register-provisioner-app.yml APP_PERMISSIONS and re-register to enable.
+          RUN_ID=""
+          for delay in 5 8 12 15 20 30; do
+            sleep "$delay"
+            RUN_ID=$(gh api "repos/$OWNER/$REPO/actions/runs?event=repository_dispatch&per_page=5" \
+              --jq '[.workflow_runs[] | select(.name=="Bootstrap (dispatch)")] | first | .id | tostring' \
+              2>/dev/null || true)
+            [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] && break
+            RUN_ID=""
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            {
+              echo "## Clone activation — bootstrap.yml dispatched (run ID not captured)"
+              echo ""
+              echo "Path D step 2 fired against \`$OWNER/$REPO\`."
+              echo "Could not capture run ID — Provisioner App may lack \`actions:read\`."
+              echo "Grant \`actions:read\` in \`register-provisioner-app.yml\` APP_PERMISSIONS and re-register."
+              echo ""
+              echo "**Vendor-floor steps required** (per ADR-0007):"
+              echo "- R-07: GitHub App 2-click registration"
+              echo "- R-04: Telegram bot tap"
+              echo "- R-10: Linear workspace decision"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          RUN_URL="https://github.com/$OWNER/$REPO/actions/runs/$RUN_ID"
+          echo "::notice::Bootstrap run $RUN_ID captured — polling to completion (max 90 min incl. R-07)"
+          {
+            echo "## Clone activation — bootstrap.yml dispatched"
+            echo ""
+            echo "Run: $RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Poll to completion — max 90 min (360 × 15s) to cover R-07 operator 2-click.
+          CONCLUSION="" empty_streak=0
+          for ((attempt=1; attempt<=360; attempt++)); do
+            DATA=$(gh api "repos/$OWNER/$REPO/actions/runs/$RUN_ID" 2>/dev/null || true)
+            if [ -z "$DATA" ]; then
+              empty_streak=$((empty_streak+1))
+              if [ $((empty_streak % 5)) -eq 0 ]; then
+                echo "::warning::Bootstrap poll: $empty_streak consecutive empty responses from API (token issue?)"
+              fi
+              sleep 15; continue
+            fi
+            empty_streak=0
+            read -r STATUS CONCLUSION <<< "$(printf '%s' "$DATA" | python3 -c \
+              "import json,sys; d=json.load(sys.stdin); print(d.get('status',''), d.get('conclusion') or '')" \
+              2>/dev/null || echo ' ')"
+            if [ "$STATUS" = "completed" ]; then
+              break
+            fi
+            if [ $((attempt % 10)) -eq 0 ]; then
+              echo "::notice::Bootstrap in $OWNER/$REPO — still running (attempt $attempt/360)"
+            fi
+            sleep 15
+          done
+
+          # Write final bootstrap job table to summary
+          JOB_TABLE=$(gh api "repos/$OWNER/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | "| \(.name) | \(.conclusion // .status) |"' 2>/dev/null || true)
+          {
+            echo ""
+            echo "### Bootstrap result: **${CONCLUSION:-unknown}**"
+            echo ""
+            echo "| Job | Result |"
+            echo "|-----|--------|"
+            printf '%s\n' "$JOB_TABLE"
+            echo ""
+            echo "**Vendor-floor steps required** (per ADR-0007):"
+            echo "- R-07: GitHub App 2-click (if not already done)"
+            echo "- R-04: Telegram bot tap"
+            echo "- R-10: Linear workspace decision"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CONCLUSION" = "success" ]; then
+            echo "::notice::Bootstrap completed successfully in $OWNER/$REPO"
+          else
+            echo "::error::Bootstrap in $OWNER/$REPO completed with: ${CONCLUSION:-timeout}"
+            exit 1
+          fi

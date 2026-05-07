@@ -1,0 +1,164 @@
+name: Rotate cloudflare-api-token
+
+# Mints a fresh data-plane Cloudflare API Token via the operator's
+# token-creator (CLOUDFLARE_USER_ADDITIONAL_API, holds 'API Tokens Write')
+# and writes it as the latest version of cloudflare-api-token in GCP
+# Secret Manager.
+#
+# Built 2026-05-02 after probe-all-cf-tokens (run 25255289114) confirmed
+# the existing cloudflare-api-token returns HTTP 401 / code 1000 invalid,
+# while CLOUDFLARE_USER_ADDITIONAL_API is active with API-Tokens-Write
+# permission. This unblocks the Phase 2 apply-cloudflare-spec.yml step
+# without operator UI interaction.
+#
+# Permissions on the minted token:
+#   - Zone:Zone:Read              (apply-cloudflare-spec zone lookup)
+#   - Zone:DNS:Edit               (terraform/cloudflare.tf DNS records)
+#   - Zone:Workers Routes:Edit    (clone deploy Worker route binding)
+#   - Account:Workers Scripts:Edit (clone deploy.yml wrangler)
+#   - Account:Account Settings:Read (wrangler prereq)
+
+on:
+  workflow_dispatch:
+    inputs:
+      token_name:
+        description: 'Friendly name for the new token (visible in CF dashboard)'
+        required: false
+        default: 'autonomous-agent-template-builder data-plane'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rotate:
+    name: Mint new data-plane token + write to GCP SM
+    runs-on: ubuntu-latest
+    # No checkout — this workflow only calls GCP + Cloudflare APIs and
+    # writes back to GCP Secret Manager; never reads repo files.
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Read creator token + account id
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            creator:${{ vars.GCP_PROJECT_ID }}/CLOUDFLARE_USER_ADDITIONAL_API
+            account_id:${{ vars.GCP_PROJECT_ID }}/cloudflare-account-id
+
+      - name: Mint new data-plane token + write to GCP SM
+        env:
+          CREATOR:    ${{ steps.secrets.outputs.creator }}
+          ACCOUNT_ID: ${{ steps.secrets.outputs.account_id }}
+          TOKEN_NAME: ${{ inputs.token_name }}
+          TARGET_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+
+          PG_FILE=/tmp/pg.json
+          curl -s -o "$PG_FILE" \
+            -H "Authorization: Bearer $CREATOR" \
+            -H "Accept: application/json" \
+            'https://api.cloudflare.com/client/v4/user/tokens/permission_groups?per_page=200'
+
+          # Resolve permission group IDs by name. Fail early if any are missing.
+          resolve() {
+            local name="$1"
+            local id
+            id=$(jq -r --arg n "$name" '.result[] | select(.name == $n) | .id' "$PG_FILE" | head -1)
+            if [ -z "$id" ]; then
+              echo "::error::permission group '$name' not found in /user/tokens/permission_groups"
+              exit 1
+            fi
+            printf '%s' "$id"
+          }
+          ZONE_READ=$(resolve "Zone Read")
+          DNS_WRITE=$(resolve "DNS Write")
+          ROUTES_WRITE=$(resolve "Workers Routes Write")
+          WORKERS_SCRIPTS_WRITE=$(resolve "Workers Scripts Write")
+          ACCOUNT_SETTINGS_READ=$(resolve "Account Settings Read")
+
+          ACCOUNT_RESOURCE="com.cloudflare.api.account.${ACCOUNT_ID}"
+          ZONE_WILDCARD="com.cloudflare.api.account.zone.*"
+
+          # Build POST body. One policy per resource-scope; group permission
+          # groups by scope so we issue the minimum number of policies.
+          BODY=$(jq -n \
+            --arg name "$TOKEN_NAME" \
+            --arg account_res "$ACCOUNT_RESOURCE" \
+            --arg zone_res "$ZONE_WILDCARD" \
+            --arg zone_read "$ZONE_READ" \
+            --arg dns_write "$DNS_WRITE" \
+            --arg routes_write "$ROUTES_WRITE" \
+            --arg scripts_write "$WORKERS_SCRIPTS_WRITE" \
+            --arg account_settings_read "$ACCOUNT_SETTINGS_READ" \
+            '{
+              name: $name,
+              policies: [
+                {
+                  effect: "allow",
+                  resources: { ($zone_res): "*" },
+                  permission_groups: [
+                    {id: $zone_read},
+                    {id: $dns_write},
+                    {id: $routes_write}
+                  ]
+                },
+                {
+                  effect: "allow",
+                  resources: { ($account_res): "*" },
+                  permission_groups: [
+                    {id: $scripts_write},
+                    {id: $account_settings_read}
+                  ]
+                }
+              ]
+            }')
+
+          STATUS=$(curl -s -o /tmp/new.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $CREATOR" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            https://api.cloudflare.com/client/v4/user/tokens)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error title=token-mint-FAIL::HTTP $STATUS"
+            jq -r '.errors // .' /tmp/new.json
+            exit 1
+          fi
+
+          NEW_TOKEN=$(jq -r '.result.value' /tmp/new.json)
+          NEW_ID=$(jq -r '.result.id' /tmp/new.json)
+          echo "::add-mask::$NEW_TOKEN"
+          if [ -z "$NEW_TOKEN" ] || [ "$NEW_TOKEN" = "null" ]; then
+            echo "::error::minted token had no .result.value"
+            exit 1
+          fi
+
+          # Store as new latest version of cloudflare-api-token. Note: secret
+          # container is created by bootstrap; we only add a version here.
+          printf '%s' "$NEW_TOKEN" | gcloud secrets versions add cloudflare-api-token \
+            --project="$TARGET_PROJECT" --data-file=-
+          echo "::notice title=token-rotated::id=$NEW_ID written as new version of cloudflare-api-token in $TARGET_PROJECT"
+
+          # Self-verify the freshly-minted token works.
+          VSTATUS=$(curl -s -o /tmp/v.json -w "%{http_code}" \
+            -H "Authorization: Bearer $NEW_TOKEN" \
+            -H "Accept: application/json" \
+            https://api.cloudflare.com/client/v4/user/tokens/verify)
+          if [ "$VSTATUS" = "200" ]; then
+            STATUS_FIELD=$(jq -r '.result.status' /tmp/v.json)
+            echo "::notice title=verify-OK::HTTP $VSTATUS status=$STATUS_FIELD"
+          else
+            BODY_TRUNC=$(tr '\n' '|' < /tmp/v.json | head -c 400)
+            echo "::error title=verify-FAIL::HTTP $VSTATUS body=$BODY_TRUNC"
+            exit 1
+          fi

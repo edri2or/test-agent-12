@@ -1,0 +1,1285 @@
+name: Stage 6 — Configure Agent Actions (Action Router + HITL Gate + Session Init)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  configure:
+    name: Deploy Action Router + HITL Gate + Session Init → N8N + E2E gate
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      N8N_OWNER_EMAIL: ${{ vars.N8N_OWNER_EMAIL }}
+      GITHUB_APP_INSTALLATION_ID: ${{ vars.GITHUB_APP_INSTALLATION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch secrets from GCP Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            railway-api-token:${{ vars.GCP_PROJECT_ID }}/railway-api-token
+            n8n-admin-password-plaintext:${{ vars.GCP_PROJECT_ID }}/n8n-admin-password-plaintext
+            railway-project-id:${{ vars.GCP_PROJECT_ID }}/railway-project-id
+            railway-environment-id:${{ vars.GCP_PROJECT_ID }}/railway-environment-id
+            telegram-bot-token:${{ vars.GCP_PROJECT_ID }}/telegram-bot-token
+            TELEGRAM_CHAT_ID:${{ vars.GCP_PROJECT_ID }}/TELEGRAM_CHAT_ID
+            n8n-secrets-broker-token:${{ vars.GCP_PROJECT_ID }}/n8n-secrets-broker-token
+            github-app-id:${{ vars.GCP_PROJECT_ID }}/github-app-id
+            github-app-private-key:${{ vars.GCP_PROJECT_ID }}/github-app-private-key
+
+      - name: Export Railway project/environment IDs to env
+        run: |
+          echo "RAILWAY_PROJECT_ID=${{ steps.secrets.outputs.railway-project-id }}" >> "$GITHUB_ENV"
+          echo "RAILWAY_ENVIRONMENT_ID=${{ steps.secrets.outputs.railway-environment-id }}" >> "$GITHUB_ENV"
+
+      - name: Resolve N8N Railway service domain
+        id: domain
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+        run: |
+          RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){services{edges{node{id name}}}}}","variables":{"pid":$pid}}')")
+
+          N8N_SVC_ID=$(echo "$RESP" | jq -r \
+            '[.data.project.services.edges[] | select(.node.name == "n8n")] | first | .node.id // empty')
+          [ -n "$N8N_SVC_ID" ] || { echo "::error::N8N service not found in Railway project"; exit 1; }
+
+          DOMAINS_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg sid "$N8N_SVC_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+              '{"query":"query($sid:String!,$eid:String!){serviceInstance(serviceId:$sid,environmentId:$eid){domains{serviceDomains{id domain}}}}","variables":{"sid":$sid,"eid":$eid}}')")
+
+          N8N_DOMAIN=$(echo "$DOMAINS_RESP" | jq -r \
+            '(.data.serviceInstance.domains.serviceDomains // []) | .[0].domain // empty')
+          [ -n "$N8N_DOMAIN" ] || { echo "::error::N8N Railway service domain not found"; exit 1; }
+
+          echo "N8N domain: $N8N_DOMAIN"
+          echo "n8n_domain=$N8N_DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for N8N to be healthy
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          CHECK_URL="https://$N8N_DOMAIN/healthz/readiness"
+          for attempt in $(seq 1 10); do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$CHECK_URL" 2>/dev/null)
+            echo "Attempt $attempt/10: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && { echo "N8N is healthy."; break; }
+            [ "$attempt" = "10" ] && { echo "::error::N8N health check failed after 10 attempts"; exit 1; }
+            sleep 15
+          done
+
+      - name: Login to N8N + create CI API key
+        id: n8n_auth
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          N8N_OWNER_PASSWORD: ${{ steps.secrets.outputs.n8n-admin-password-plaintext }}
+        run: |
+          BASE_URL="https://$N8N_DOMAIN"
+
+          LOGIN_RESP=$(curl -s -c /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/login" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn \
+              --arg email "$N8N_OWNER_EMAIL" \
+              --arg pw "$N8N_OWNER_PASSWORD" \
+              '{"emailOrLdapLoginId":$email,"password":$pw}')")
+
+          USER_ID=$(echo "$LOGIN_RESP" | jq -r '.data.id // empty')
+          [ -n "$USER_ID" ] || { echo "::error::N8N login failed: $(echo "$LOGIN_RESP" | jq -r '.code // .message // .')"; exit 1; }
+          echo "Logged in as user $USER_ID"
+
+          EXPIRES=$(( $(date +%s) * 1000 + 3600000 ))
+          APIKEY_RESP=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/api-keys" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --argjson exp "$EXPIRES" \
+              '{"label":"stage6-agent-actions-ci","scopes":["credential:create","credential:list","workflow:create","workflow:list","workflow:update","variable:create","variable:list","variable:update"],"expiresAt":$exp}')")
+
+          N8N_API_KEY=$(echo "$APIKEY_RESP" | jq -r '.data.rawApiKey // empty')
+          N8N_API_KEY_ID=$(echo "$APIKEY_RESP" | jq -r '.data.id // empty')
+          [ -n "$N8N_API_KEY" ] || { echo "::error::Failed to create N8N API key: $APIKEY_RESP"; exit 1; }
+
+          echo "::add-mask::$N8N_API_KEY"
+          echo "n8n_api_key=$N8N_API_KEY" >> "$GITHUB_OUTPUT"
+          echo "n8n_api_key_id=$N8N_API_KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
+          echo "N8N CI API key created (id: $N8N_API_KEY_ID)."
+
+      - name: Upsert Agent Session Auth credential in N8N (idempotent)
+        id: session_credential
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          N8N_SECRETS_BROKER_TOKEN: ${{ steps.secrets.outputs.n8n-secrets-broker-token }}
+        run: |
+          # Agent Session Auth uses the broker token as a placeholder.
+          # The actual session token is a short-lived OTP written to /tmp by the session-start hook.
+          # This credential is updated by the Session Init workflow after OTP validation.
+          CREDS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/credentials?limit=100")
+          CRED_ID=$(echo "$CREDS" | jq -r \
+            '[(.data // [])[] | select(.name == "Agent Session Auth")] | first | .id // empty')
+
+          CRED_PAYLOAD=$(jq -cn --arg token "$N8N_SECRETS_BROKER_TOKEN" \
+            '{"name":"Agent Session Auth","type":"httpHeaderAuth","data":{"name":"Authorization","value":("Bearer " + $token)}}')
+
+          if [ -n "$CRED_ID" ]; then
+            echo "Updating Agent Session Auth credential ($CRED_ID)..."
+            curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X PATCH "$BASE_URL/api/v1/credentials/$CRED_ID" \
+              -H "Content-Type: application/json" \
+              -d "$CRED_PAYLOAD" > /dev/null
+          else
+            echo "Creating Agent Session Auth credential..."
+            CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/credentials" \
+              -H "Content-Type: application/json" \
+              -d "$CRED_PAYLOAD")
+            CRED_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$CRED_ID" ] || { echo "::error::Credential creation failed: $CREATE"; exit 1; }
+            echo "Created credential: $CRED_ID"
+          fi
+
+          echo "session_credential_id=$CRED_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update Action Router workflow in N8N (idempotent)
+        id: action_router
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          SESSION_CRED_ID: ${{ steps.session_credential.outputs.session_credential_id }}
+          GITHUB_APP_ID: ${{ steps.secrets.outputs.github-app-id }}
+          GITHUB_APP_PRIVATE_KEY: ${{ steps.secrets.outputs.github-app-private-key }}
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          [ -n "$GITHUB_APP_ID" ] || { echo "::error::GITHUB_APP_ID is empty in GCP SM"; exit 1; }
+          [ -n "$GITHUB_APP_PRIVATE_KEY" ] || { echo "::error::GITHUB_APP_PRIVATE_KEY is empty in GCP SM"; exit 1; }
+
+          WORKFLOWS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/workflows?limit=100")
+          WF_ID=$(echo "$WORKFLOWS" | jq -r \
+            '[(.data // [])[] | select(.name == "Action Router")] | first | .id // empty')
+
+          # Build JWT Code node: validates action + creates RS256 JWT using require('crypto').createSign.
+          # PEM and App ID are embedded via jq @json so newlines survive the workflow JSON round-trip.
+          # require('crypto') is a Node.js built-in — available even in N8N 1.70+ task runner sandbox.
+          # HTTP calls (installation token, workflow runs) use HTTP Request nodes (sandbox-free).
+          BUILD_JWT_CODE=$(jq -rn \
+            --arg app_id "$GITHUB_APP_ID" \
+            --arg pem "$GITHUB_APP_PRIVATE_KEY" \
+            '"const body=$input.first().json.body;" +
+             "const action=body?.action;" +
+             "const agentId=body?.agent_identity||\"unknown\";" +
+             "const LEVEL1=[\"list_workflow_runs\",\"get_run_status\"];" +
+             "const LEVEL2=[\"trigger_workflow\"];" +
+             "if(!action)return[{json:{ok:false,error:\"action is required\"}}];" +
+             "if(LEVEL2.includes(action))return[{json:{level2:true,action,agent_identity:agentId,params:body?.params||{}}}];" +
+             "if(!LEVEL1.includes(action))return[{json:{ok:false,error:\"Unknown action: \"+action}}];" +
+             "try{" +
+             "const crypto=require(\"crypto\");" +
+             "const appId=" + ($app_id|@json) + ";" +
+             "const pem=" + ($pem|@json) + ";" +
+             "const now=Math.floor(Date.now()/1000);" +
+             "const hdr=Buffer.from(JSON.stringify({alg:\"RS256\",typ:\"JWT\"})).toString(\"base64url\");" +
+             "const pld=Buffer.from(JSON.stringify({iat:now-60,exp:now+600,iss:String(appId)})).toString(\"base64url\");" +
+             "const msg=hdr+\".\"+pld;" +
+             "const s=crypto.createSign(\"SHA256\");" +
+             "s.update(msg);" +
+             "const sig=s.sign(pem,\"base64url\");" +
+             "return[{json:{jwt:msg+\".\"+sig,action,agent_identity:agentId}}];" +
+             "}catch(e){return[{json:{ok:false,error:\"JWT signing failed: \"+e.message}}];}\"')
+
+          # Format Response checks for GitHub API errors (no workflow_runs = error response from GitHub).
+          # neverError:true on HTTP Request nodes ensures 4xx responses reach this node instead of halting execution.
+          FORMAT_RESP_CODE='const d=$input.first().json;if(!d.workflow_runs){const msg=d.message||d.error_description||JSON.stringify(d).slice(0,200);return [{json:{ok:false,error:"GitHub API error: "+msg}}];}const runs=(d.workflow_runs||[]).slice(0,10).map(r=>({id:r.id,name:r.name,status:r.status,conclusion:r.conclusion,created_at:r.created_at,html_url:r.html_url}));return [{json:{ok:true,action:"list_workflow_runs",result:{total_count:d.total_count||0,runs}}}];'
+
+          # N8N expression strings — $ must be escaped from bash but kept literal for N8N.
+          EXPR_BEARER_JWT="={{ 'Bearer ' + \$json.jwt }}"
+          EXPR_BEARER_TOKEN="={{ 'Bearer ' + \$json.token }}"
+
+          HITL_GATE_URL="https://$N8N_DOMAIN/webhook/hitl-gate"
+
+          FORMAT_LEVEL2_CODE='const d=$input.first().json;return [{json:{status:"pending_approval",action:d.action||"trigger_workflow",agent_identity:d.agent_identity||"unknown",message:"Operator approval requested via Telegram"}}];'
+
+          BUILD_LEVEL2_PAYLOAD_CODE='const d=$input.first().json;return [{json:{body_str:JSON.stringify({action:d.action,params:d.params,agent_identity:d.agent_identity}),action:d.action,agent_identity:d.agent_identity}}];'
+
+          INSTALL_TOKEN_URL="https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens"
+          RUNS_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs?per_page=10"
+          USER_AGENT_ROUTER="${GITHUB_REPOSITORY}/action-router"
+
+          WF_JSON=$(jq -cn \
+            --arg cred_id "$SESSION_CRED_ID" \
+            --arg build_jwt_code "$BUILD_JWT_CODE" \
+            --arg format_resp_code "$FORMAT_RESP_CODE" \
+            --arg format_level2_code "$FORMAT_LEVEL2_CODE" \
+            --arg build_level2_payload_code "$BUILD_LEVEL2_PAYLOAD_CODE" \
+            --arg hitl_gate_url "$HITL_GATE_URL" \
+            --arg expr_bearer_jwt "$EXPR_BEARER_JWT" \
+            --arg expr_bearer_token "$EXPR_BEARER_TOKEN" \
+            --arg install_token_url "$INSTALL_TOKEN_URL" \
+            --arg runs_url "$RUNS_URL" \
+            --arg user_agent_router "$USER_AGENT_ROUTER" \
+            '{
+              "name": "Action Router",
+              "nodes": [
+                {
+                  "id": "webhook-router",
+                  "name": "Action Router Webhook",
+                  "type": "n8n-nodes-base.webhook",
+                  "typeVersion": 1,
+                  "position": [250, 300],
+                  "parameters": {
+                    "httpMethod": "POST",
+                    "path": "action-router",
+                    "responseMode": "responseNode",
+                    "authentication": "headerAuth",
+                    "options": {}
+                  },
+                  "credentials": {
+                    "httpHeaderAuth": {
+                      "id": $cred_id,
+                      "name": "Agent Session Auth"
+                    }
+                  }
+                },
+                {
+                  "id": "code-build-jwt",
+                  "name": "Build JWT",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [500, 300],
+                  "parameters": {
+                    "jsCode": $build_jwt_code
+                  }
+                },
+                {
+                  "id": "if-level2",
+                  "name": "Is Level 2?",
+                  "type": "n8n-nodes-base.if",
+                  "typeVersion": 1,
+                  "position": [750, 300],
+                  "parameters": {
+                    "conditions": {
+                      "boolean": [
+                        {
+                          "value1": "={{ $json.level2 === true }}",
+                          "value2": true
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "id": "code-build-level2-payload",
+                  "name": "Build Level2 Payload",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [1000, 120],
+                  "parameters": {
+                    "jsCode": $build_level2_payload_code
+                  }
+                },
+                {
+                  "id": "http-call-hitl-gate",
+                  "name": "Call HITL Gate",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [1250, 120],
+                  "parameters": {
+                    "method": "POST",
+                    "url": $hitl_gate_url,
+                    "authentication": "none",
+                    "sendBody": true,
+                    "contentType": "raw",
+                    "rawContentType": "application/json",
+                    "body": "={{ $json.body_str }}",
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "code-format-level2",
+                  "name": "Format Level2 Response",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [1500, 120],
+                  "parameters": {
+                    "jsCode": $format_level2_code
+                  }
+                },
+                {
+                  "id": "if-valid",
+                  "name": "Is Valid Action?",
+                  "type": "n8n-nodes-base.if",
+                  "typeVersion": 1,
+                  "position": [1000, 480],
+                  "parameters": {
+                    "conditions": {
+                      "string": [
+                        {
+                          "value1": "={{ $json.jwt }}",
+                          "operation": "isNotEmpty"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "id": "http-get-token",
+                  "name": "Get Installation Token",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [1250, 420],
+                  "parameters": {
+                    "method": "POST",
+                    "url": $install_token_url,
+                    "authentication": "none",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                      "parameters": [
+                        {"name": "Accept", "value": "application/vnd.github.v3+json"},
+                        {"name": "User-Agent", "value": $user_agent_router},
+                        {"name": "Authorization", "value": $expr_bearer_jwt}
+                      ]
+                    },
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "http-list-runs",
+                  "name": "List Workflow Runs",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [1500, 420],
+                  "parameters": {
+                    "method": "GET",
+                    "url": $runs_url,
+                    "authentication": "none",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                      "parameters": [
+                        {"name": "Accept", "value": "application/vnd.github.v3+json"},
+                        {"name": "User-Agent", "value": $user_agent_router},
+                        {"name": "Authorization", "value": $expr_bearer_token}
+                      ]
+                    },
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "code-format",
+                  "name": "Format Response",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [1750, 420],
+                  "parameters": {
+                    "jsCode": $format_resp_code
+                  }
+                },
+                {
+                  "id": "respond-router",
+                  "name": "Respond to Agent",
+                  "type": "n8n-nodes-base.respondToWebhook",
+                  "typeVersion": 1,
+                  "position": [2000, 300],
+                  "parameters": {
+                    "respondWith": "firstIncomingItem"
+                  }
+                }
+              ],
+              "connections": {
+                "Action Router Webhook": {
+                  "main": [[{"node": "Build JWT", "type": "main", "index": 0}]]
+                },
+                "Build JWT": {
+                  "main": [[{"node": "Is Level 2?", "type": "main", "index": 0}]]
+                },
+                "Is Level 2?": {
+                  "main": [
+                    [{"node": "Build Level2 Payload", "type": "main", "index": 0}],
+                    [{"node": "Is Valid Action?", "type": "main", "index": 0}]
+                  ]
+                },
+                "Build Level2 Payload": {
+                  "main": [[{"node": "Call HITL Gate", "type": "main", "index": 0}]]
+                },
+                "Call HITL Gate": {
+                  "main": [[{"node": "Format Level2 Response", "type": "main", "index": 0}]]
+                },
+                "Format Level2 Response": {
+                  "main": [[{"node": "Respond to Agent", "type": "main", "index": 0}]]
+                },
+                "Is Valid Action?": {
+                  "main": [
+                    [{"node": "Get Installation Token", "type": "main", "index": 0}],
+                    [{"node": "Respond to Agent", "type": "main", "index": 0}]
+                  ]
+                },
+                "Get Installation Token": {
+                  "main": [[{"node": "List Workflow Runs", "type": "main", "index": 0}]]
+                },
+                "List Workflow Runs": {
+                  "main": [[{"node": "Format Response", "type": "main", "index": 0}]]
+                },
+                "Format Response": {
+                  "main": [[{"node": "Respond to Agent", "type": "main", "index": 0}]]
+                }
+              },
+              "settings": {"executionOrder": "v1"}
+            }')
+
+          if [ -n "$WF_ID" ]; then
+            echo "Updating Action Router workflow ($WF_ID)..."
+            PUT_RESP=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X PUT "$BASE_URL/api/v1/workflows/$WF_ID" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            echo "$PUT_RESP" | jq -e '.data.id // .id' > /dev/null 2>&1 \
+              || { echo "::error::Action Router update failed: $PUT_RESP"; exit 1; }
+          else
+            echo "Creating Action Router workflow..."
+            CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/workflows" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            WF_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$WF_ID" ] || { echo "::error::Action Router creation failed: $CREATE"; exit 1; }
+            echo "Created Action Router workflow: $WF_ID"
+          fi
+
+          echo "action_router_id=$WF_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Activate Action Router workflow
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          WF_ID: ${{ steps.action_router.outputs.action_router_id }}
+        run: |
+          WF_RESP=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/workflows/$WF_ID")
+          ACTIVE=$(echo "$WF_RESP" | jq -r '.data.active // "false"')
+          VERSION_ID=$(echo "$WF_RESP" | jq -r '.data.versionId // empty')
+          [ -n "$VERSION_ID" ] || { echo "::error::versionId missing: $WF_RESP"; exit 1; }
+
+          if [ "$ACTIVE" = "true" ]; then
+            echo "Action Router already active — re-activating..."
+            curl -s -b /tmp/n8n_cookies.txt -X POST "$BASE_URL/rest/workflows/$WF_ID/deactivate" > /dev/null
+          fi
+
+          ACTIVATE=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/workflows/$WF_ID/activate" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg vid "$VERSION_ID" '{"versionId":$vid}')")
+          ACTIVATED=$(echo "$ACTIVATE" | jq -r '.data.active // "false"')
+          [ "$ACTIVATED" = "true" ] || { echo "::error::Failed to activate Action Router: $ACTIVATE"; exit 1; }
+          echo "Action Router activated."
+
+      - name: Create or update HITL Gate workflow in N8N (idempotent)
+        id: hitl_gate
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          SESSION_CRED_ID: ${{ steps.session_credential.outputs.session_credential_id }}
+          TELEGRAM_BOT_TOKEN: ${{ steps.secrets.outputs.telegram-bot-token }}
+          TELEGRAM_CHAT_ID: ${{ steps.secrets.outputs.TELEGRAM_CHAT_ID }}
+        run: |
+          WORKFLOWS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/workflows?limit=100")
+          WF_ID=$(echo "$WORKFLOWS" | jq -r \
+            '[(.data // [])[] | select(.name == "HITL Gate")] | first | .id // empty')
+
+          # Build Telegram Approval Message code: validates allowlist, builds sendMessage JSON body.
+          # Bot token + chat ID embedded via jq @json. Unicode escapes used for Hebrew/emoji.
+          BUILD_TG_MSG_CODE=$(jq -rn \
+            --arg bot_token "$TELEGRAM_BOT_TOKEN" \
+            --arg chat_id "$TELEGRAM_CHAT_ID" \
+            '"const body=$input.first().json.body;" +
+             "const action=body?.action||\"\";" +
+             "const params=body?.params||{};" +
+             "const agentId=body?.agent_identity||\"unknown\";" +
+             "const workflowId=params?.workflow_id||\"unknown\";" +
+             "const ALLOWED=[\"rotate-github-pats.yml\",\"configure-agent-actions.yml\"];" +
+             "if(action!==\"trigger_workflow\"||!ALLOWED.includes(workflowId)){" +
+             "return [{json:{ok:false,error:\"Workflow not in Level 2 allowlist: \"+workflowId}}];}" +
+             "const botToken=" + ($bot_token|@json) + ";" +
+             "const chatId=" + ($chat_id|@json) + ";" +
+             "const cbApprove=JSON.stringify({a:\"tw\",w:workflowId,v:\"1\"});" +
+             "const cbReject=JSON.stringify({a:\"tw\",w:workflowId,v:\"0\"});" +
+             "const msgText=\"\\uD83E\\uDD16 \\u05D1\\u05E7\\u05E9\\u05EA \\u05E1\\u05D5\\u05DB\\u05DF:\\n\" +" +
+             "\"\\u05E4\\u05E2\\u05D5\\u05DC\\u05D4: trigger_workflow\\n\" +" +
+             "\"\\u05E7\\u05D5\\u05D1\\u05E5: \"+workflowId+\"\\n\" +" +
+             "\"\\u05E1\\u05D5\\u05DB\\u05DF: \"+agentId+\"\\n\\n\\u05DC\\u05D0\\u05E9\\u05E8?\";" +
+             "const reqBody=JSON.stringify({chat_id:chatId,text:msgText," +
+             "reply_markup:{inline_keyboard:[[" +
+             "{text:\"\\u2705 \\u05D0\\u05E9\\u05E8\",callback_data:cbApprove}," +
+             "{text:\"\\u274C \\u05D3\\u05D7\\u05D4\",callback_data:cbReject}" +
+             "]]}});" +
+             "return [{json:{telegram_url:\"https://api.telegram.org/bot\"+botToken+\"/sendMessage\"," +
+             "telegram_body:reqBody,ok:true,action,params,agent_identity:agentId}}];\"')
+
+          WF_JSON=$(jq -cn \
+            --arg cred_id "$SESSION_CRED_ID" \
+            --arg build_tg_msg_code "$BUILD_TG_MSG_CODE" \
+            '{
+              "name": "HITL Gate",
+              "nodes": [
+                {
+                  "id": "hitl-gate-webhook",
+                  "name": "HITL Gate Webhook",
+                  "type": "n8n-nodes-base.webhook",
+                  "typeVersion": 1,
+                  "position": [250, 300],
+                  "parameters": {
+                    "httpMethod": "POST",
+                    "path": "hitl-gate",
+                    "responseMode": "responseNode",
+                    "authentication": "headerAuth",
+                    "options": {}
+                  },
+                  "credentials": {
+                    "httpHeaderAuth": {
+                      "id": $cred_id,
+                      "name": "Agent Session Auth"
+                    }
+                  }
+                },
+                {
+                  "id": "code-build-tg-msg",
+                  "name": "Build Telegram Approval Message",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [500, 300],
+                  "parameters": {
+                    "jsCode": $build_tg_msg_code
+                  }
+                },
+                {
+                  "id": "http-send-tg-approval",
+                  "name": "Send Telegram Approval Request",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [750, 300],
+                  "parameters": {
+                    "method": "POST",
+                    "url": "={{ $json.telegram_url }}",
+                    "sendBody": true,
+                    "contentType": "raw",
+                    "rawContentType": "application/json",
+                    "body": "={{ $json.telegram_body }}",
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "respond-hitl-gate",
+                  "name": "Respond - Pending Approval",
+                  "type": "n8n-nodes-base.respondToWebhook",
+                  "typeVersion": 1,
+                  "position": [1000, 300],
+                  "parameters": {
+                    "respondWith": "json",
+                    "responseBody": "{\"status\":\"pending_approval\",\"message\":\"Operator approval requested via Telegram\"}"
+                  }
+                }
+              ],
+              "connections": {
+                "HITL Gate Webhook": {
+                  "main": [[{"node": "Build Telegram Approval Message", "type": "main", "index": 0}]]
+                },
+                "Build Telegram Approval Message": {
+                  "main": [[{"node": "Send Telegram Approval Request", "type": "main", "index": 0}]]
+                },
+                "Send Telegram Approval Request": {
+                  "main": [[{"node": "Respond - Pending Approval", "type": "main", "index": 0}]]
+                }
+              },
+              "settings": {"executionOrder": "v1"}
+            }')
+
+          if [ -n "$WF_ID" ]; then
+            echo "Updating HITL Gate workflow ($WF_ID)..."
+            PUT_RESP=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X PUT "$BASE_URL/api/v1/workflows/$WF_ID" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            echo "$PUT_RESP" | jq -e '.data.id // .id' > /dev/null 2>&1 \
+              || { echo "::error::HITL Gate update failed: $PUT_RESP"; exit 1; }
+          else
+            echo "Creating HITL Gate workflow..."
+            CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/workflows" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            WF_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$WF_ID" ] || { echo "::error::HITL Gate creation failed: $CREATE"; exit 1; }
+            echo "Created HITL Gate workflow: $WF_ID"
+          fi
+          echo "hitl_gate_id=$WF_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Activate HITL Gate workflow
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          WF_ID: ${{ steps.hitl_gate.outputs.hitl_gate_id }}
+        run: |
+          WF_RESP=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/workflows/$WF_ID")
+          ACTIVE=$(echo "$WF_RESP" | jq -r '.data.active // "false"')
+          VERSION_ID=$(echo "$WF_RESP" | jq -r '.data.versionId // empty')
+          [ -n "$VERSION_ID" ] || { echo "::error::versionId missing: $WF_RESP"; exit 1; }
+          if [ "$ACTIVE" = "true" ]; then
+            echo "HITL Gate already active — re-activating..."
+            curl -s -b /tmp/n8n_cookies.txt -X POST "$BASE_URL/rest/workflows/$WF_ID/deactivate" > /dev/null
+          fi
+          ACTIVATE=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/workflows/$WF_ID/activate" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg vid "$VERSION_ID" '{"versionId":$vid}')")
+          ACTIVATED=$(echo "$ACTIVATE" | jq -r '.data.active // "false"')
+          [ "$ACTIVATED" = "true" ] || { echo "::error::Failed to activate HITL Gate: $ACTIVATE"; exit 1; }
+          echo "HITL Gate activated."
+
+      - name: Create or update HITL Callback Receiver workflow in N8N (idempotent)
+        id: hitl_callback
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          GITHUB_APP_ID: ${{ steps.secrets.outputs.github-app-id }}
+          GITHUB_APP_PRIVATE_KEY: ${{ steps.secrets.outputs.github-app-private-key }}
+          TELEGRAM_BOT_TOKEN: ${{ steps.secrets.outputs.telegram-bot-token }}
+        run: |
+          WORKFLOWS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/workflows?limit=100")
+          WF_ID=$(echo "$WORKFLOWS" | jq -r \
+            '[(.data // [])[] | select(.name == "HITL Callback Receiver")] | first | .id // empty')
+
+          # Parse Callback Data: validates callback_data, builds Telegram API URLs with embedded bot token.
+          PARSE_CB_CODE=$(jq -rn \
+            --arg bot_token "$TELEGRAM_BOT_TOKEN" \
+            '"const d=$input.first().json.body;" +
+             "const callbackQueryId=d?.callback_query_id||\"\";" +
+             "const callbackData=d?.callback_data||\"{}\";" +
+             "const chatId=d?.chat_id||\"\";" +
+             "if(!callbackQueryId){return [{json:{ok:false,error:\"Missing callback_query_id\"}}];}" +
+             "let parsed;" +
+             "try{parsed=JSON.parse(callbackData);}catch(e){return [{json:{ok:false,error:\"Invalid callback_data\"}}];}" +
+             "const action=parsed.a;" +
+             "const workflowId=parsed.w;" +
+             "const approved=parsed.v===\"1\";" +
+             "const ALLOWED=[\"rotate-github-pats.yml\",\"configure-agent-actions.yml\"];" +
+             "if(action!==\"tw\"||!ALLOWED.includes(workflowId)){" +
+             "return [{json:{ok:false,error:\"Invalid action or workflow: \"+workflowId}}];}" +
+             "const botToken=" + ($bot_token|@json) + ";" +
+             "return [{json:{approved,workflowId,callbackQueryId,chatId," +
+             "answer_url:\"https://api.telegram.org/bot\"+botToken+\"/answerCallbackQuery\"," +
+             "send_url:\"https://api.telegram.org/bot\"+botToken+\"/sendMessage\"}}];\"')
+
+          # Build JWT (HITL): same RS256 pattern as Action Router; spreads input fields to carry context.
+          BUILD_JWT_HITL_CODE=$(jq -rn \
+            --arg app_id "$GITHUB_APP_ID" \
+            --arg pem "$GITHUB_APP_PRIVATE_KEY" \
+            '"const d=$input.first().json;" +
+             "try{" +
+             "const crypto=require(\"crypto\");" +
+             "const appId=" + ($app_id|@json) + ";" +
+             "const pem=" + ($pem|@json) + ";" +
+             "const now=Math.floor(Date.now()/1000);" +
+             "const hdr=Buffer.from(JSON.stringify({alg:\"RS256\",typ:\"JWT\"})).toString(\"base64url\");" +
+             "const pld=Buffer.from(JSON.stringify({iat:now-60,exp:now+600,iss:String(appId)})).toString(\"base64url\");" +
+             "const msg=hdr+\".\"+pld;" +
+             "const s=crypto.createSign(\"SHA256\");" +
+             "s.update(msg);" +
+             "const sig=s.sign(pem,\"base64url\");" +
+             "return [{json:{...d,jwt:msg+\".\"+sig}}];" +
+             "}catch(e){return [{json:{ok:false,error:\"JWT failed: \"+e.message}}];}\"')
+
+          # Restore Context: re-reads Parse Callback Data output after the HTTP token exchange.
+          # Uses $("NodeName") N8N expression to access a non-adjacent node's output.
+          RESTORE_CTX_CODE='const ctx=$("Parse Callback Data").first().json;const tokenResp=$input.first().json;const token=tokenResp.token;if(!token){return [{json:{ok:false,error:"Token missing: "+JSON.stringify(tokenResp).slice(0,200)}}];}return [{json:{token,workflowId:ctx.workflowId,chatId:ctx.chatId,callbackQueryId:ctx.callbackQueryId,answer_url:ctx.answer_url,send_url:ctx.send_url,dispatch_url:"https://api.github.com/repos/'"$GITHUB_REPOSITORY"'/actions/workflows/"+ctx.workflowId+"/dispatches"}}];'
+
+          # Prepare Telegram responses for approved/rejected paths.
+          PREP_TG_APPROVED_CODE='const ctx=$("Restore Context").first().json;return [{json:{answer_url:ctx.answer_url,answer_body:JSON.stringify({callback_query_id:ctx.callbackQueryId,text:"✅ Dispatching..."}),send_url:ctx.send_url,confirm_body:JSON.stringify({chat_id:ctx.chatId,text:"✅ Workflow הופעל: "+ctx.workflowId})}}];'
+          PREP_TG_REJECTED_CODE='const ctx=$input.first().json;return [{json:{answer_url:ctx.answer_url,answer_body:JSON.stringify({callback_query_id:ctx.callbackQueryId,text:"❌ Rejected"}),send_url:ctx.send_url,reject_body:JSON.stringify({chat_id:ctx.chatId,text:"❌ הבקשה נדחתה."})}}];'
+
+          EXPR_BEARER_TOKEN_DISPATCH="={{ 'Bearer ' + \$('Restore Context').first().json.token }}"
+          EXPR_BEARER_TOKEN_JWT="={{ 'Bearer ' + \$json.jwt }}"
+
+          INSTALL_TOKEN_URL_HITL="https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens"
+          USER_AGENT_HITL="${GITHUB_REPOSITORY}/hitl-callback"
+
+          WF_JSON=$(jq -cn \
+            --arg parse_cb_code "$PARSE_CB_CODE" \
+            --arg build_jwt_hitl_code "$BUILD_JWT_HITL_CODE" \
+            --arg restore_ctx_code "$RESTORE_CTX_CODE" \
+            --arg prep_tg_approved_code "$PREP_TG_APPROVED_CODE" \
+            --arg prep_tg_rejected_code "$PREP_TG_REJECTED_CODE" \
+            --arg expr_bearer_token_dispatch "$EXPR_BEARER_TOKEN_DISPATCH" \
+            --arg expr_bearer_token_jwt "$EXPR_BEARER_TOKEN_JWT" \
+            --arg install_token_url_hitl "$INSTALL_TOKEN_URL_HITL" \
+            --arg user_agent_hitl "$USER_AGENT_HITL" \
+            '{
+              "name": "HITL Callback Receiver",
+              "nodes": [
+                {
+                  "id": "hitl-cb-webhook",
+                  "name": "HITL Callback Webhook",
+                  "type": "n8n-nodes-base.webhook",
+                  "typeVersion": 1,
+                  "position": [250, 300],
+                  "parameters": {
+                    "httpMethod": "POST",
+                    "path": "hitl-callback",
+                    "responseMode": "responseNode",
+                    "options": {}
+                  }
+                },
+                {
+                  "id": "code-parse-cb",
+                  "name": "Parse Callback Data",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [500, 300],
+                  "parameters": {
+                    "jsCode": $parse_cb_code
+                  }
+                },
+                {
+                  "id": "if-approved",
+                  "name": "Is Approved?",
+                  "type": "n8n-nodes-base.if",
+                  "typeVersion": 1,
+                  "position": [750, 300],
+                  "parameters": {
+                    "conditions": {
+                      "boolean": [
+                        {
+                          "value1": "={{ $json.approved === true }}",
+                          "value2": true
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "id": "code-build-jwt-hitl",
+                  "name": "Build JWT (HITL)",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [1000, 150],
+                  "parameters": {
+                    "jsCode": $build_jwt_hitl_code
+                  }
+                },
+                {
+                  "id": "http-get-token-hitl",
+                  "name": "Get Token (HITL)",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [1250, 150],
+                  "parameters": {
+                    "method": "POST",
+                    "url": $install_token_url_hitl,
+                    "authentication": "none",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                      "parameters": [
+                        {"name": "Accept", "value": "application/vnd.github.v3+json"},
+                        {"name": "User-Agent", "value": $user_agent_hitl},
+                        {"name": "Authorization", "value": $expr_bearer_token_jwt}
+                      ]
+                    },
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "code-restore-ctx",
+                  "name": "Restore Context",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [1500, 150],
+                  "parameters": {
+                    "jsCode": $restore_ctx_code
+                  }
+                },
+                {
+                  "id": "http-dispatch",
+                  "name": "Dispatch Workflow",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [1750, 150],
+                  "parameters": {
+                    "method": "POST",
+                    "url": "={{ $json.dispatch_url }}",
+                    "authentication": "none",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                      "parameters": [
+                        {"name": "Accept", "value": "application/vnd.github.v3+json"},
+                        {"name": "User-Agent", "value": $user_agent_hitl},
+                        {"name": "Authorization", "value": $expr_bearer_token_dispatch},
+                        {"name": "X-GitHub-Api-Version", "value": "2022-11-28"}
+                      ]
+                    },
+                    "sendBody": true,
+                    "contentType": "raw",
+                    "rawContentType": "application/json",
+                    "body": "{\"ref\":\"main\",\"inputs\":{}}",
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "code-prep-tg-approved",
+                  "name": "Prep Telegram Approved",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [2000, 150],
+                  "parameters": {
+                    "jsCode": $prep_tg_approved_code
+                  }
+                },
+                {
+                  "id": "http-answer-approved",
+                  "name": "Answer Callback (Approved)",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [2250, 150],
+                  "parameters": {
+                    "method": "POST",
+                    "url": "={{ $json.answer_url }}",
+                    "sendBody": true,
+                    "contentType": "raw",
+                    "rawContentType": "application/json",
+                    "body": "={{ $json.answer_body }}",
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "http-send-confirm",
+                  "name": "Send Confirmation",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [2500, 150],
+                  "parameters": {
+                    "method": "POST",
+                    "url": "={{ $(\"Prep Telegram Approved\").first().json.send_url }}",
+                    "sendBody": true,
+                    "contentType": "raw",
+                    "rawContentType": "application/json",
+                    "body": "={{ $(\"Prep Telegram Approved\").first().json.confirm_body }}",
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "code-prep-tg-rejected",
+                  "name": "Prep Telegram Rejected",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [1000, 450],
+                  "parameters": {
+                    "jsCode": $prep_tg_rejected_code
+                  }
+                },
+                {
+                  "id": "http-answer-rejected",
+                  "name": "Answer Callback (Rejected)",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [1250, 450],
+                  "parameters": {
+                    "method": "POST",
+                    "url": "={{ $json.answer_url }}",
+                    "sendBody": true,
+                    "contentType": "raw",
+                    "rawContentType": "application/json",
+                    "body": "={{ $json.answer_body }}",
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "http-send-rejection",
+                  "name": "Send Rejection",
+                  "type": "n8n-nodes-base.httpRequest",
+                  "typeVersion": 3,
+                  "position": [1500, 450],
+                  "parameters": {
+                    "method": "POST",
+                    "url": "={{ $(\"Prep Telegram Rejected\").first().json.send_url }}",
+                    "sendBody": true,
+                    "contentType": "raw",
+                    "rawContentType": "application/json",
+                    "body": "={{ $(\"Prep Telegram Rejected\").first().json.reject_body }}",
+                    "options": {
+                      "response": {
+                        "response": {
+                          "neverError": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": "respond-hitl-cb",
+                  "name": "Respond 200",
+                  "type": "n8n-nodes-base.respondToWebhook",
+                  "typeVersion": 1,
+                  "position": [2750, 300],
+                  "parameters": {
+                    "respondWith": "json",
+                    "responseBody": "{\"ok\":true}"
+                  }
+                }
+              ],
+              "connections": {
+                "HITL Callback Webhook": {
+                  "main": [[{"node": "Parse Callback Data", "type": "main", "index": 0}]]
+                },
+                "Parse Callback Data": {
+                  "main": [[{"node": "Is Approved?", "type": "main", "index": 0}]]
+                },
+                "Is Approved?": {
+                  "main": [
+                    [{"node": "Build JWT (HITL)", "type": "main", "index": 0}],
+                    [{"node": "Prep Telegram Rejected", "type": "main", "index": 0}]
+                  ]
+                },
+                "Build JWT (HITL)": {
+                  "main": [[{"node": "Get Token (HITL)", "type": "main", "index": 0}]]
+                },
+                "Get Token (HITL)": {
+                  "main": [[{"node": "Restore Context", "type": "main", "index": 0}]]
+                },
+                "Restore Context": {
+                  "main": [[{"node": "Dispatch Workflow", "type": "main", "index": 0}]]
+                },
+                "Dispatch Workflow": {
+                  "main": [[{"node": "Prep Telegram Approved", "type": "main", "index": 0}]]
+                },
+                "Prep Telegram Approved": {
+                  "main": [[{"node": "Answer Callback (Approved)", "type": "main", "index": 0}]]
+                },
+                "Answer Callback (Approved)": {
+                  "main": [[{"node": "Send Confirmation", "type": "main", "index": 0}]]
+                },
+                "Send Confirmation": {
+                  "main": [[{"node": "Respond 200", "type": "main", "index": 0}]]
+                },
+                "Prep Telegram Rejected": {
+                  "main": [[{"node": "Answer Callback (Rejected)", "type": "main", "index": 0}]]
+                },
+                "Answer Callback (Rejected)": {
+                  "main": [[{"node": "Send Rejection", "type": "main", "index": 0}]]
+                },
+                "Send Rejection": {
+                  "main": [[{"node": "Respond 200", "type": "main", "index": 0}]]
+                }
+              },
+              "settings": {"executionOrder": "v1"}
+            }')
+
+          if [ -n "$WF_ID" ]; then
+            echo "Updating HITL Callback Receiver workflow ($WF_ID)..."
+            PUT_RESP=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X PUT "$BASE_URL/api/v1/workflows/$WF_ID" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            echo "$PUT_RESP" | jq -e '.data.id // .id' > /dev/null 2>&1 \
+              || { echo "::error::HITL Callback Receiver update failed: $PUT_RESP"; exit 1; }
+          else
+            echo "Creating HITL Callback Receiver workflow..."
+            CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/workflows" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            WF_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$WF_ID" ] || { echo "::error::HITL Callback Receiver creation failed: $CREATE"; exit 1; }
+            echo "Created HITL Callback Receiver workflow: $WF_ID"
+          fi
+          echo "hitl_callback_id=$WF_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Activate HITL Callback Receiver workflow
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          WF_ID: ${{ steps.hitl_callback.outputs.hitl_callback_id }}
+        run: |
+          WF_RESP=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/workflows/$WF_ID")
+          ACTIVE=$(echo "$WF_RESP" | jq -r '.data.active // "false"')
+          VERSION_ID=$(echo "$WF_RESP" | jq -r '.data.versionId // empty')
+          [ -n "$VERSION_ID" ] || { echo "::error::versionId missing: $WF_RESP"; exit 1; }
+          if [ "$ACTIVE" = "true" ]; then
+            echo "HITL Callback Receiver already active — re-activating..."
+            curl -s -b /tmp/n8n_cookies.txt -X POST "$BASE_URL/rest/workflows/$WF_ID/deactivate" > /dev/null
+          fi
+          ACTIVATE=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/workflows/$WF_ID/activate" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg vid "$VERSION_ID" '{"versionId":$vid}')")
+          ACTIVATED=$(echo "$ACTIVATE" | jq -r '.data.active // "false"')
+          [ "$ACTIVATED" = "true" ] || { echo "::error::Failed to activate HITL Callback Receiver: $ACTIVATE"; exit 1; }
+          echo "HITL Callback Receiver activated."
+
+      - name: Create or update Session Init workflow in N8N (idempotent)
+        id: session_init
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          N8N_SECRETS_BROKER_TOKEN: ${{ steps.secrets.outputs.n8n-secrets-broker-token }}
+        run: |
+          WORKFLOWS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/workflows?limit=100")
+          WF_ID=$(echo "$WORKFLOWS" | jq -r \
+            '[(.data // [])[] | select(.name == "Session Init")] | first | .id // empty')
+
+          # Session Init: unauthenticated webhook — OTP validation is the security layer.
+          # OTP = HMAC-SHA256(broker_token, 30min_time_window)[0:16].
+          # Telegram Bot computes the same OTP on /agent-session — no shared store needed.
+          # Valid OTP returns the broker token as the session token (used for Action Router auth).
+          WF_JSON=$(jq -cn \
+            --arg broker_token "$N8N_SECRETS_BROKER_TOKEN" \
+            '{
+              "name": "Session Init",
+              "nodes": [
+                {
+                  "id": "webhook-session",
+                  "name": "Session Init Webhook",
+                  "type": "n8n-nodes-base.webhook",
+                  "typeVersion": 1,
+                  "position": [250, 300],
+                  "parameters": {
+                    "httpMethod": "POST",
+                    "path": "agent-session-init",
+                    "responseMode": "responseNode",
+                    "options": {}
+                  }
+                },
+                {
+                  "id": "code-session",
+                  "name": "Validate OTP + Issue Token",
+                  "type": "n8n-nodes-base.code",
+                  "typeVersion": 2,
+                  "position": [500, 300],
+                  "parameters": {
+                    "jsCode": ("const body = $input.first().json.body;\nconst otp = body?.otp;\nif (!otp || typeof otp !== \"string\" || !/^[0-9a-f]{16}$/.test(otp)) return [{json: {error: \"otp required (16 hex chars)\"}}];\nconst bt = " + ($broker_token | @json) + ";\nconst now = Math.floor(Date.now() / (30 * 60 * 1000));\nconst exp1 = require(\"crypto\").createHmac(\"sha256\", bt).update(now.toString()).digest(\"hex\").substring(0, 16);\nconst exp2 = require(\"crypto\").createHmac(\"sha256\", bt).update((now - 1).toString()).digest(\"hex\").substring(0, 16);\nif (otp !== exp1 && otp !== exp2) return [{json: {error: \"OTP invalid or expired\"}}];\nreturn [{json: {token: bt, expires_at: new Date(Date.now() + 8 * 3600 * 1000).toISOString()}}];")
+                  }
+                },
+                {
+                  "id": "respond-session",
+                  "name": "Respond with Token",
+                  "type": "n8n-nodes-base.respondToWebhook",
+                  "typeVersion": 1,
+                  "position": [750, 300],
+                  "parameters": {
+                    "respondWith": "firstIncomingItem"
+                  }
+                }
+              ],
+              "connections": {
+                "Session Init Webhook": {
+                  "main": [[{"node": "Validate OTP + Issue Token", "type": "main", "index": 0}]]
+                },
+                "Validate OTP + Issue Token": {
+                  "main": [[{"node": "Respond with Token", "type": "main", "index": 0}]]
+                }
+              },
+              "settings": {"executionOrder": "v1"}
+            }')
+
+          if [ -n "$WF_ID" ]; then
+            echo "Updating Session Init workflow ($WF_ID)..."
+            PUT_RESP=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X PUT "$BASE_URL/api/v1/workflows/$WF_ID" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            echo "$PUT_RESP" | jq -e '.data.id // .id' > /dev/null 2>&1 \
+              || { echo "::error::Session Init update failed: $PUT_RESP"; exit 1; }
+          else
+            echo "Creating Session Init workflow..."
+            CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/workflows" \
+              -H "Content-Type: application/json" \
+              -d "$WF_JSON")
+            WF_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$WF_ID" ] || { echo "::error::Session Init creation failed: $CREATE"; exit 1; }
+            echo "Created Session Init workflow: $WF_ID"
+          fi
+
+          echo "session_init_id=$WF_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Activate Session Init workflow
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          WF_ID: ${{ steps.session_init.outputs.session_init_id }}
+        run: |
+          WF_RESP=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/workflows/$WF_ID")
+          ACTIVE=$(echo "$WF_RESP" | jq -r '.data.active // "false"')
+          VERSION_ID=$(echo "$WF_RESP" | jq -r '.data.versionId // empty')
+          [ -n "$VERSION_ID" ] || { echo "::error::versionId missing: $WF_RESP"; exit 1; }
+
+          if [ "$ACTIVE" = "true" ]; then
+            echo "Session Init already active — re-activating..."
+            curl -s -b /tmp/n8n_cookies.txt -X POST "$BASE_URL/rest/workflows/$WF_ID/deactivate" > /dev/null
+          fi
+
+          ACTIVATE=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/workflows/$WF_ID/activate" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg vid "$VERSION_ID" '{"versionId":$vid}')")
+          ACTIVATED=$(echo "$ACTIVATE" | jq -r '.data.active // "false"')
+          [ "$ACTIVATED" = "true" ] || { echo "::error::Failed to activate Session Init: $ACTIVATE"; exit 1; }
+          echo "Session Init activated."
+
+      - name: E2E gate — POST to Action Router (list_workflow_runs) → verify ok:true
+        id: e2e
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          N8N_SECRETS_BROKER_TOKEN: ${{ steps.secrets.outputs.n8n-secrets-broker-token }}
+        run: |
+          echo "Running E2E gate: list_workflow_runs..."
+          HTTP_CODE="000"
+          for attempt in $(seq 1 10); do
+            HTTP_CODE=$(curl -s -o /tmp/router_resp.txt -w "%{http_code}" --max-time 15 \
+              -X POST "https://$N8N_DOMAIN/webhook/action-router" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $N8N_SECRETS_BROKER_TOKEN" \
+              -d '{"action":"list_workflow_runs","params":{},"agent_identity":"configure-agent-actions-e2e"}')
+            [ "$HTTP_CODE" = "200" ] && break
+            echo "Attempt $attempt/10: HTTP $HTTP_CODE — waiting..."
+            sleep $((attempt < 5 ? 3 : 5))
+          done
+
+          RESP=$(cat /tmp/router_resp.txt 2>/dev/null || echo "")
+          echo "HTTP status: $HTTP_CODE"
+          echo "Raw response (first 500 chars): ${RESP:0:500}"
+
+          OK=$(echo "$RESP" | jq -r '.ok // empty' 2>/dev/null || echo "")
+          if [ "$OK" != "true" ]; then
+            ERROR=$(echo "$RESP" | jq -r '.error // "empty response (possible Code node exception)"' 2>/dev/null || echo "parse error")
+            echo "::error::Action Router E2E failed. HTTP=$HTTP_CODE error=$ERROR resp=${RESP:0:300}"
+            exit 1
+          fi
+          RUN_COUNT=$(echo "$RESP" | jq -r '.result.runs | length' 2>/dev/null || echo "?")
+          echo "E2E Level 1 PASSED — Action Router returned ok:true, $RUN_COUNT runs listed."
+
+          echo "Running E2E gate Level 2: trigger_workflow → pending_approval..."
+          HTTP_CODE2="000"
+          for attempt in $(seq 1 5); do
+            HTTP_CODE2=$(curl -s -o /tmp/router_resp2.txt -w "%{http_code}" --max-time 15 \
+              -X POST "https://$N8N_DOMAIN/webhook/action-router" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $N8N_SECRETS_BROKER_TOKEN" \
+              -d '{"action":"trigger_workflow","params":{"workflow_id":"rotate-github-pats.yml"},"agent_identity":"configure-agent-actions-e2e-l2"}')
+            [ "$HTTP_CODE2" = "200" ] && break
+            echo "Attempt $attempt/5: HTTP $HTTP_CODE2 — waiting..."
+            sleep 3
+          done
+          RESP2=$(cat /tmp/router_resp2.txt 2>/dev/null || echo "")
+          echo "HTTP status Level 2: $HTTP_CODE2"
+          echo "Raw response Level 2 (first 300): ${RESP2:0:300}"
+          STATUS=$(echo "$RESP2" | jq -r '.status // empty' 2>/dev/null || echo "")
+          if [ "$STATUS" != "pending_approval" ]; then
+            echo "::error::Action Router Level 2 E2E failed. Expected status:pending_approval, got: $STATUS. resp=${RESP2:0:300}"
+            exit 1
+          fi
+          echo "E2E Level 2 PASSED — Action Router returned status:pending_approval."
+
+      - name: Revoke CI API key
+        if: always()
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          KEY_ID: ${{ steps.n8n_auth.outputs.n8n_api_key_id }}
+        run: |
+          [ -z "$KEY_ID" ] && { echo "No API key ID captured — skipping revocation."; exit 0; }
+          curl -s -b /tmp/n8n_cookies.txt \
+            -X DELETE "$BASE_URL/rest/api-keys/$KEY_ID" > /dev/null
+          echo "CI API key $KEY_ID revoked."
+
+      - name: Summary
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          ACTION_ROUTER_ID: ${{ steps.action_router.outputs.action_router_id }}
+          SESSION_INIT_ID: ${{ steps.session_init.outputs.session_init_id }}
+          HITL_GATE_ID: ${{ steps.hitl_gate.outputs.hitl_gate_id }}
+          HITL_CALLBACK_ID: ${{ steps.hitl_callback.outputs.hitl_callback_id }}
+          SESSION_CRED_ID: ${{ steps.session_credential.outputs.session_credential_id }}
+        run: |
+          {
+            echo "## Stage 6 — Agent Actions Complete"
+            echo ""
+            echo "| Resource | Detail | Status |"
+            echo "|----------|--------|--------|"
+            echo "| N8N credential | \`Agent Session Auth\` (ID: \`$SESSION_CRED_ID\`) | ✅ |"
+            echo "| N8N workflow | \`Action Router\` (ID: \`$ACTION_ROUTER_ID\`) — Level 1+2 | ✅ Active |"
+            echo "| N8N workflow | \`HITL Gate\` (ID: \`$HITL_GATE_ID\`) | ✅ Active |"
+            echo "| N8N workflow | \`HITL Callback Receiver\` (ID: \`$HITL_CALLBACK_ID\`) | ✅ Active |"
+            echo "| N8N workflow | \`Session Init\` (ID: \`$SESSION_INIT_ID\`) | ✅ Active |"
+            echo "| Action Router URL | \`https://$N8N_DOMAIN/webhook/action-router\` | ✅ |"
+            echo "| HITL Gate URL | \`https://$N8N_DOMAIN/webhook/hitl-gate\` | ✅ |"
+            echo "| HITL Callback URL | \`https://$N8N_DOMAIN/webhook/hitl-callback\` | ✅ |"
+            echo "| E2E Level 1 | list_workflow_runs → ok:true | ✅ |"
+            echo "| E2E Level 2 | trigger_workflow → status:pending_approval | ✅ |"
+            echo ""
+            echo "**HITL flow**: Agent requests trigger_workflow → Telegram inline buttons →"
+            echo "Operator taps ✅ → HITL Callback Receiver dispatches via GitHub App token."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,143 @@
+{
+  "name": "research-agent",
+  "nodes": [
+    {
+      "id": "webhook-research",
+      "name": "research-agent Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "research-agent",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-context",
+      "name": "Extract Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst text = (body.text || '').toString();\nconst chatId = String(body.chat_id || '');\nconst isTest = chatId === 'test' || chatId.startsWith('test-');\nreturn [{ json: { text, chat_id: chatId, is_test: isTest } }];"
+      }
+    },
+    {
+      "id": "http-openrouter",
+      "name": "Ask OpenRouter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [750, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'openai/gpt-4o-mini', messages: [{ role: 'system', content: 'You are a research assistant. Reply in Hebrew, short (under 300 chars), no code blocks.' }, { role: 'user', content: $json.text }], max_tokens: 300 }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "@@CRED_OPENROUTER_ID@@",
+          "name": "OpenRouter"
+        }
+      }
+    },
+    {
+      "id": "code-build-reply",
+      "name": "Build Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 300],
+      "parameters": {
+        "jsCode": "const ctx = $('Extract Context').first().json;\nconst resp = $input.first().json || {};\nlet answer = '';\ntry {\n  answer = (resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) || '';\n} catch (e) { answer = ''; }\nif (!answer) { answer = '\\u26a0\\ufe0f research-agent \\u05dc\\u05d0 \\u05d4\\u05e6\\u05dc\\u05d9\\u05d7 \\u05dc\\u05e2\\u05e0\\u05d5\\u05ea.'; }\nconst reply = '\\ud83d\\udd0d ' + answer;\nreturn [{ json: { chat_id: ctx.chat_id, reply_text: reply, is_test: ctx.is_test } }];"
+      }
+    },
+    {
+      "id": "if-test",
+      "name": "Is Test?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{ $json.is_test }}", "value2": true }
+          ]
+        }
+      }
+    },
+    {
+      "id": "telegram-send",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1500, 400],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply_text }}"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "@@CRED_TELEGRAM_ID@@",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1750, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, agent: 'research', reply: $json.reply_text }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "research-agent Webhook": {
+      "main": [[{ "node": "Extract Context", "type": "main", "index": 0 }]]
+    },
+    "Extract Context": {
+      "main": [[{ "node": "Ask OpenRouter", "type": "main", "index": 0 }]]
+    },
+    "Ask OpenRouter": {
+      "main": [[{ "node": "Build Reply", "type": "main", "index": 0 }]]
+    },
+    "Build Reply": {
+      "main": [[{ "node": "Is Test?", "type": "main", "index": 0 }]]
+    },
+    "Is Test?": {
+      "main": [
+        [{ "node": "Respond", "type": "main", "index": 0 }],
+        [{ "node": "Send Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Reply": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

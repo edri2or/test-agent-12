@@ -1,0 +1,12 @@
+# Per ADR-0011 §2 — `name` is namespaced by the per-clone slug so two
+# clones cohabiting an operator's Cloudflare account do not collide on
+# the (account-level-unique) Worker name. The placeholder is rendered
+# at deploy time by `.github/workflows/deploy.yml` via `envsubst` with
+# `CLONE_SLUG=${{ github.event.repository.name }}`.
+name = "${CLONE_SLUG}-edge"
+main = "src/worker/edge-router.js"
+compatibility_date = "2024-01-01"
+
+# Replace with your Railway agent service URL after deployment.
+[vars]
+RAILWAY_ORIGIN = "https://your-agent.railway.app"

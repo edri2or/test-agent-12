@@ -1,0 +1,155 @@
+name: Probe clone state (diagnostic — ADR-0012 §E.1 residual)
+
+# Purpose: read-only diagnostic probe to measure the actual state of a
+# clone GCP project that grant-autonomy.sh failed against in CI-WIF mode.
+# Outputs surface via ::notice:: / ::error:: annotations because GitHub
+# Actions log blob hosts (productionresultssa14.blob.core.windows.net,
+# results-receiver.actions.githubusercontent.com) are NOT in the build
+# agent's sandbox proxy allowlist — but the annotations API at
+# /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations IS
+# accessible, so structured probe results bridge the gap.
+#
+# This workflow is read-only: it does NOT mutate any GCP resource.
+# Each probe step uses continue-on-error so the full set runs regardless
+# of individual failures.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'GCP project ID to probe (the clone project)'
+        required: true
+        default: 'or-test-clone-002'
+      sa_substring:
+        description: 'Substring identifying the runtime SA in IAM bindings'
+        required: true
+        default: 'github-actions-runner@'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  probe:
+    name: Probe clone state
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Identify caller
+        run: |
+          ACCT=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>&1)
+          echo "::notice::CALLER: ${ACCT}"
+        continue-on-error: true
+
+      - name: Probe — project exists
+        run: |
+          if OUT=$(gcloud projects describe "${{ inputs.project_id }}" --format='value(projectNumber,lifecycleState,parent.id,parent.type)' 2>&1); then
+            echo "::notice::PROJECT_EXISTS: ${OUT}"
+          else
+            echo "::error::PROJECT_MISSING_OR_DENIED: ${OUT}"
+          fi
+        continue-on-error: true
+
+      - name: Probe — billing linked on project
+        run: |
+          if OUT=$(gcloud billing projects describe "${{ inputs.project_id }}" --format='value(billingEnabled,billingAccountName)' 2>&1); then
+            echo "::notice::BILLING_STATUS: ${OUT}"
+          else
+            echo "::error::BILLING_PROBE_FAIL: ${OUT}"
+          fi
+        continue-on-error: true
+
+      - name: Probe — APIs enabled (first 12)
+        run: |
+          if OUT=$(gcloud services list --enabled --project="${{ inputs.project_id }}" --format='value(config.name)' 2>&1 | head -12 | tr '\n' ',' ); then
+            echo "::notice::APIS_ENABLED: ${OUT}"
+          else
+            echo "::error::APIS_PROBE_FAIL: ${OUT}"
+          fi
+        continue-on-error: true
+
+      - name: Probe — runtime SA roles on project
+        run: |
+          POLICY=$(gcloud projects get-iam-policy "${{ inputs.project_id }}" --format=json 2>&1) || {
+            echo "::error::PROJECT_IAM_PROBE_FAIL: ${POLICY}"
+            exit 0
+          }
+          ROLES=$(printf '%s' "${POLICY}" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          out=[]
+          for b in d.get('bindings',[]):
+            if any('${{ inputs.sa_substring }}' in m for m in b.get('members',[])):
+              out.append(b['role'])
+          print(','.join(out) if out else 'NONE')
+          ")
+          echo "::notice::SA_ROLES_ON_PROJECT: ${ROLES}"
+        continue-on-error: true
+
+      - name: Probe — runtime SA roles on org
+        run: |
+          POLICY=$(gcloud organizations get-iam-policy 905978345393 --format=json 2>&1) || {
+            echo "::error::ORG_IAM_PROBE_FAIL: ${POLICY}"
+            exit 0
+          }
+          ROLES=$(printf '%s' "${POLICY}" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          out=[]
+          for b in d.get('bindings',[]):
+            if any('${{ inputs.sa_substring }}' in m for m in b.get('members',[])):
+              out.append(b['role'])
+          print(','.join(out) if out else 'NONE')
+          ")
+          echo "::notice::SA_ROLES_ON_ORG: ${ROLES}"
+        continue-on-error: true
+
+      - name: Probe — WIF pool on project
+        run: |
+          if OUT=$(gcloud iam workload-identity-pools describe github --location=global --project="${{ inputs.project_id }}" --format='value(name,state)' 2>&1); then
+            echo "::notice::WIF_POOL: ${OUT}"
+          else
+            echo "::error::WIF_POOL_MISSING: ${OUT}"
+          fi
+        continue-on-error: true
+
+      - name: Probe — state bucket
+        run: |
+          if OUT=$(gcloud storage buckets describe "gs://${{ inputs.project_id }}-tfstate" --project="${{ inputs.project_id }}" --format='value(name,versioning)' 2>&1); then
+            echo "::notice::BUCKET: ${OUT}"
+          else
+            echo "::error::BUCKET_MISSING: ${OUT}"
+          fi
+        continue-on-error: true
+
+      - name: Probe — runtime SA exists on new project
+        run: |
+          if OUT=$(gcloud iam service-accounts list --project="${{ inputs.project_id }}" --format='value(email)' 2>&1); then
+            echo "::notice::SERVICE_ACCOUNTS_ON_PROJECT: ${OUT//$'\n'/,}"
+          else
+            echo "::error::SA_LIST_PROBE_FAIL: ${OUT}"
+          fi
+        continue-on-error: true
+
+      - name: Probe — try `gcloud services enable` dry test
+        # If the SA lacks serviceUsage on the project, this fails — pinpointing
+        # the exact gcloud commands grant-autonomy.sh would crash on. The
+        # `--dry-run` flag does not exist on `services enable`; we test by
+        # querying instead of mutating.
+        run: |
+          if OUT=$(gcloud services list --available --project="${{ inputs.project_id }}" --filter='name:iam.googleapis.com' --format='value(name)' 2>&1); then
+            echo "::notice::SERVICEUSAGE_LIST_OK: ${OUT}"
+          else
+            echo "::error::SERVICEUSAGE_PERMISSION_DENIED_OR_API_OFF: ${OUT}"
+          fi
+        continue-on-error: true

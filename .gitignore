@@ -1,0 +1,61 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*_rsa
+*_dsa
+*_ecdsa
+*_ed25519
+credentials.json
+service-account*.json
+*-service-account.json
+
+# Terraform state — contains sensitive output values
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Node
+node_modules/
+dist/
+build/
+*.js.map
+coverage/
+
+# TypeScript
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Railway
+.railway/
+
+# n8n local data
+.n8n/
+
+# Local logs (JOURNEY.md is git-tracked; local raw logs are not)
+*.log
+logs/
+!docs/JOURNEY.md
+
+# Python build artifacts
+__pycache__/
+*.pyc

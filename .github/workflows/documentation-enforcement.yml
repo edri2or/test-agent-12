@@ -1,0 +1,115 @@
+name: Documentation Enforcement
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'terraform/**'
+      - 'docs/adr/**'
+      - 'policy/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  policy-check:
+    name: OPA/Conftest Policy Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Conftest
+        run: |
+          VERSION="0.55.0"
+          curl -Lo conftest.tar.gz \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${VERSION}/conftest_${VERSION}_Linux_x86_64.tar.gz"
+          tar xzf conftest.tar.gz conftest
+          chmod +x conftest
+          sudo mv conftest /usr/local/bin/
+
+      - name: Get changed files
+        id: changed
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+          cat /tmp/changed_files.txt
+
+          # Detect if src/ was modified
+          if grep -q '^src/' /tmp/changed_files.txt; then
+            echo "src_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "src_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Detect if terraform/ was modified
+          if grep -q '^terraform/' /tmp/changed_files.txt; then
+            echo "terraform_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "terraform_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Check for JOURNEY.md update
+          if grep -q '^docs/JOURNEY\.md$' /tmp/changed_files.txt; then
+            echo "journey_updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "journey_updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Check for CLAUDE.md update
+          if grep -q 'CLAUDE\.md$' /tmp/changed_files.txt; then
+            echo "claude_updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "claude_updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Check for new ADR
+          if grep -q '^docs/adr/' /tmp/changed_files.txt; then
+            echo "adr_updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "adr_updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate policy input
+        run: |
+          cat > /tmp/policy_input.json << EOF
+          {
+            "src_changed": ${{ steps.changed.outputs.src_changed }},
+            "terraform_changed": ${{ steps.changed.outputs.terraform_changed }},
+            "journey_updated": ${{ steps.changed.outputs.journey_updated }},
+            "claude_updated": ${{ steps.changed.outputs.claude_updated }},
+            "adr_updated": ${{ steps.changed.outputs.adr_updated }},
+            "changed_files": $(cat /tmp/changed_files.txt | jq -Rs 'split("\n") | map(select(. != ""))')
+          }
+          EOF
+          cat /tmp/policy_input.json
+
+      - name: Evaluate context_sync policy
+        run: |
+          conftest test /tmp/policy_input.json \
+            --policy policy/context_sync.rego \
+            --namespace context_sync
+
+      - name: Evaluate ADR policy
+        run: |
+          conftest test /tmp/policy_input.json \
+            --policy policy/adr.rego \
+            --namespace adr
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Policy Evaluation Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| src/ changed | ${{ steps.changed.outputs.src_changed }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| JOURNEY.md updated | ${{ steps.changed.outputs.journey_updated }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CLAUDE.md updated | ${{ steps.changed.outputs.claude_updated }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| terraform/ changed | ${{ steps.changed.outputs.terraform_changed }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ADR updated | ${{ steps.changed.outputs.adr_updated }} |" >> "$GITHUB_STEP_SUMMARY"

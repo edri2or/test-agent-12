@@ -1,0 +1,9 @@
+# Placeholder URLs that appear in docs as illustrative examples — not real endpoints.
+# Lychee should not try to resolve them.
+^https://YOUR_N8N_URL/.*
+^https://your-org\.example\.com/.*
+^https://api\.example\.com/.*
+# Railway template hostnames that are project-specific placeholders
+^https://<n8n-service>-<project>\.up\.railway\.app/.*
+# Claude Code session deep-links — not navigable from external networks
+^https://claude\.ai/code/session_.*

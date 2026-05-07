@@ -1,0 +1,244 @@
+{
+  "name": "GitHub PR (real handler — open PR via GitHub App)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "github-pr",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "GitHub PR Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "github-pr"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 validation of the inbound webhook (R-02: fail-closed).\nconst crypto = require('crypto');\nconst secret = $env['GITHUB_PR_WEBHOOK_SECRET'] ?? '';\nif (!secret) throw new Error('GITHUB_PR_WEBHOOK_SECRET missing — fail-closed (R-02)');\nconst sig = $input.first().headers['x-signature-256'] ?? '';\nconst rawBody = $input.first().binary?.data?.data\n  ? Buffer.from($input.first().binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify($input.first().json);\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nif (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n  throw new Error('Invalid HMAC — dropping payload (R-02)');\n}\n\nconst body = $input.first().json ?? {};\nconst title = body.title;\nconst head = body.head;\nif (!title || typeof title !== 'string') throw new Error('Missing or non-string title');\nif (!head || typeof head !== 'string') throw new Error('Missing or non-string head (source branch)');\nconst prBody = typeof body.body === 'string' ? body.body : '';\nconst base = typeof body.base === 'string' && body.base.length > 0 ? body.base : '';\nconst draft = body.draft === true;\nconst chat_id = body.chat_id ? String(body.chat_id) : '';\n\nreturn [{\n  json: {\n    intent: 'pr pull request github open ' + title,\n    chat_id,\n    user_id: String(body.user_id ?? ''),\n    timestamp: new Date().toISOString(),\n    metadata: { title, body: prBody, head, base, draft }\n  }\n}];"
+      },
+      "id": "validate-and-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 over the exact body string the Router will read (ADR-0003).\nconst crypto = require('crypto');\nconst p = $input.first().json;\nconst bodyObj = {\n  intent: p.intent,\n  chat_id: p.chat_id,\n  user_id: p.user_id,\n  timestamp: p.timestamp,\n  metadata: p.metadata,\n};\nconst bodyStr = JSON.stringify(bodyObj);\nconst secret = $env['SKILLS_ROUTER_SECRET'] ?? '';\nif (!secret) throw new Error('SKILLS_ROUTER_SECRET missing — fail-closed (R-02)');\nconst sig = 'sha256=' + crypto.createHmac('sha256', secret).update(bodyStr).digest('hex');\nreturn [{ json: { _bodyStr: bodyStr, _sig: sig, _chat_id: p.chat_id, _meta: p.metadata } }];"
+      },
+      "id": "compute-hmac",
+      "name": "Compute Skills Router HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env['SKILLS_ROUTER_URL'] }}/webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-signature-256", "value": "={{ $json._sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json._bodyStr }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "call-skills-router",
+      "name": "Call Skills Router",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "right-skill",
+              "leftValue": "={{ $json.skill ?? '' }}",
+              "rightValue": "github-pr",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "not-pending",
+              "leftValue": "={{ $json.status ?? '' }}",
+              "rightValue": "pending_approval",
+              "operator": { "type": "string", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "routing-gate",
+      "name": "Routing Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Short-lived JWT — GitHub caps App JWTs at 10 min; iat-60s tolerates clock skew.\nconst crypto = require('crypto');\nconst appId = $env['GITHUB_APP_ID'] ?? '';\nconst pem = $env['GITHUB_APP_PRIVATE_KEY'] ?? '';\nif (!appId) throw new Error('GITHUB_APP_ID missing — fail-closed');\nif (!pem) throw new Error('GITHUB_APP_PRIVATE_KEY missing — fail-closed');\nconst now = Math.floor(Date.now() / 1000);\nconst header = { alg: 'RS256', typ: 'JWT' };\nconst payload = { iat: now - 60, exp: now + 540, iss: appId };\nconst b64u = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');\nconst signingInput = b64u(header) + '.' + b64u(payload);\nconst signer = crypto.createSign('RSA-SHA256');\nsigner.update(signingInput);\nconst sig = signer.sign(pem).toString('base64url');\nreturn [{ json: { _jwt: signingInput + '.' + sig } }];"
+      },
+      "id": "build-jwt",
+      "name": "Build JWT",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/app/installations/{{ $env['GITHUB_APP_INSTALLATION_ID'] }}/access_tokens",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $json._jwt }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "get-install-token",
+      "name": "Get Installation Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $env['GITHUB_OWNER'] }}/{{ $env['GITHUB_REPO'] }}/pulls",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Get Installation Token').first().json.token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ title: $('Compute Skills Router HMAC').first().json._meta.title, head: $('Compute Skills Router HMAC').first().json._meta.head, base: ($('Compute Skills Router HMAC').first().json._meta.base || $env['GITHUB_BASE_BRANCH'] || 'main'), body: $('Compute Skills Router HMAC').first().json._meta.body || '', draft: !!$('Compute Skills Router HMAC').first().json._meta.draft }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "open-pr",
+      "name": "Open PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const pr = $input.first().json;\nconst meta = $('Compute Skills Router HMAC').first().json._meta;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nconst url = pr?.html_url ?? '(URL missing in API response)';\nreturn [{ json: { chat_id, text: 'PR \"' + meta.title + '\" opened: ' + url } }];"
+      },
+      "id": "format-success",
+      "name": "Format Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nlet reason;\nif (r?.status === 'pending_approval') {\n  reason = 'pending_approval (' + (r.reason ?? 'requires_approval') + ')';\n} else if (r?.matched === false) {\n  reason = 'no skill matched';\n} else if (r?.skill && r.skill !== 'github-pr') {\n  reason = 'router routed to a different skill: ' + r.skill;\n} else {\n  reason = 'unexpected router response';\n}\nreturn [{ json: { chat_id, text: 'GitHub PR not opened — ' + reason } }];"
+      },
+      "id": "format-deny",
+      "name": "Format Deny",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.chat_id }}" },
+            { "name": "text", "value": "={{ $json.text }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "reply-telegram",
+      "name": "Reply to Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2220, 300]
+    }
+  ],
+  "connections": {
+    "GitHub PR Webhook": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[
+        { "node": "Respond 200 OK", "type": "main", "index": 0 },
+        { "node": "Compute Skills Router HMAC", "type": "main", "index": 0 }
+      ]]
+    },
+    "Compute Skills Router HMAC": {
+      "main": [[{ "node": "Call Skills Router", "type": "main", "index": 0 }]]
+    },
+    "Call Skills Router": {
+      "main": [[{ "node": "Routing Gate", "type": "main", "index": 0 }]]
+    },
+    "Routing Gate": {
+      "main": [
+        [{ "node": "Build JWT", "type": "main", "index": 0 }],
+        [{ "node": "Format Deny", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build JWT": {
+      "main": [[{ "node": "Get Installation Token", "type": "main", "index": 0 }]]
+    },
+    "Get Installation Token": {
+      "main": [[{ "node": "Open PR", "type": "main", "index": 0 }]]
+    },
+    "Open PR": {
+      "main": [[{ "node": "Format Success", "type": "main", "index": 0 }]]
+    },
+    "Format Success": {
+      "main": [[{ "node": "Reply to Telegram", "type": "main", "index": 0 }]]
+    },
+    "Format Deny": {
+      "main": [[{ "node": "Reply to Telegram", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Real handler. Pattern mirrors create-adr.json (PR #11): webhook → HMAC validate (R-02 fail-closed) → Respond 200 in parallel → ADR-0003 sign → Call Skills Router → Routing Gate IF (skill==='github-pr' && status!=='pending_approval') → GitHub-App branch (Build JWT → Get Installation Token → Open PR) → Telegram reply. Required env vars: GITHUB_PR_WEBHOOK_SECRET, SKILLS_ROUTER_URL, SKILLS_ROUTER_SECRET, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY (PEM, multi-line), GITHUB_APP_INSTALLATION_ID, GITHUB_OWNER, GITHUB_REPO, GITHUB_BASE_BRANCH (default 'main'), TELEGRAM_BOT_TOKEN. Inbound payload contract: { title: string (required), head: string (required, source branch must already exist on remote), body?: string, base?: string (defaults to GITHUB_BASE_BRANCH or 'main'), draft?: boolean, chat_id?: number|string, user_id?: number|string }. The caller is responsible for pushing 'head' before invoking this workflow; if 'head' is missing GitHub returns 422 and the error surfaces via Telegram."
+}

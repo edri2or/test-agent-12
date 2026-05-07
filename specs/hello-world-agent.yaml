@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: hello-world-agent
+  description: "Minimal echo agent — Telegram intent → reply"
+spec:
+  gcp:
+    projectId: or-hello-world-001
+    region: us-central1
+  github:
+    repo: edri2or/hello-world-agent
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: hello-world.or-infra.com
+    worker:
+      name: hello-world-edge
+      route: hello-world.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "build me a minimal echo agent with Telegram + OpenRouter"

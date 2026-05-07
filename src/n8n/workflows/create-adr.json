@@ -1,0 +1,382 @@
+{
+  "name": "Create ADR (real handler — scaffold MADR + open PR via GitHub App)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "create-adr",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Create ADR Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "create-adr"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 validation of the inbound webhook (R-02: fail-closed). Mirrors health-check.json:20.\nconst crypto = require('crypto');\nconst secret = $env['CREATE_ADR_WEBHOOK_SECRET'] ?? '';\nif (!secret) throw new Error('CREATE_ADR_WEBHOOK_SECRET missing — fail-closed (R-02)');\nconst sig = $input.first().headers['x-signature-256'] ?? '';\nconst rawBody = $input.first().binary?.data?.data\n  ? Buffer.from($input.first().binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify($input.first().json);\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nif (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n  throw new Error('Invalid HMAC — dropping payload (R-02)');\n}\n\nconst body = $input.first().json ?? {};\nconst title = body.title;\nconst context = body.context;\nif (!title || typeof title !== 'string') throw new Error('Missing or non-string title');\nif (!context || typeof context !== 'string') throw new Error('Missing or non-string context');\nconst chat_id = body.chat_id ? String(body.chat_id) : '';\n\nreturn [{\n  json: {\n    intent: 'adr architecture decision record document ' + title,\n    chat_id,\n    user_id: String(body.user_id ?? ''),\n    timestamp: new Date().toISOString(),\n    metadata: { title, context }\n  }\n}];"
+      },
+      "id": "validate-and-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 over the exact body string the Router will read (ADR-0003). Mirrors health-check.json:41.\nconst crypto = require('crypto');\nconst p = $input.first().json;\nconst bodyObj = {\n  intent: p.intent,\n  chat_id: p.chat_id,\n  user_id: p.user_id,\n  timestamp: p.timestamp,\n  metadata: p.metadata,\n};\nconst bodyStr = JSON.stringify(bodyObj);\nconst secret = $env['SKILLS_ROUTER_SECRET'] ?? '';\nif (!secret) throw new Error('SKILLS_ROUTER_SECRET missing — fail-closed (R-02)');\nconst sig = 'sha256=' + crypto.createHmac('sha256', secret).update(bodyStr).digest('hex');\nreturn [{ json: { _bodyStr: bodyStr, _sig: sig, _chat_id: p.chat_id, _meta: p.metadata } }];"
+      },
+      "id": "compute-hmac",
+      "name": "Compute Skills Router HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env['SKILLS_ROUTER_URL'] }}/webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-signature-256", "value": "={{ $json._sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json._bodyStr }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "call-skills-router",
+      "name": "Call Skills Router",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "right-skill",
+              "leftValue": "={{ $json.skill ?? '' }}",
+              "rightValue": "create-adr",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "not-pending",
+              "leftValue": "={{ $json.status ?? '' }}",
+              "rightValue": "pending_approval",
+              "operator": { "type": "string", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "routing-gate",
+      "name": "Routing Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Short-lived JWT — GitHub caps App JWTs at 10 min; iat-60s tolerates clock skew.\nconst crypto = require('crypto');\nconst appId = $env['GITHUB_APP_ID'] ?? '';\nconst pem = $env['GITHUB_APP_PRIVATE_KEY'] ?? '';\nif (!appId) throw new Error('GITHUB_APP_ID missing — fail-closed');\nif (!pem) throw new Error('GITHUB_APP_PRIVATE_KEY missing — fail-closed');\nconst now = Math.floor(Date.now() / 1000);\nconst header = { alg: 'RS256', typ: 'JWT' };\nconst payload = { iat: now - 60, exp: now + 540, iss: appId };\nconst b64u = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');\nconst signingInput = b64u(header) + '.' + b64u(payload);\nconst signer = crypto.createSign('RSA-SHA256');\nsigner.update(signingInput);\nconst sig = signer.sign(pem).toString('base64url');\nreturn [{ json: { _jwt: signingInput + '.' + sig } }];"
+      },
+      "id": "build-jwt",
+      "name": "Build JWT",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/app/installations/{{ $env['GITHUB_APP_INSTALLATION_ID'] }}/access_tokens",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $json._jwt }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "get-install-token",
+      "name": "Get Installation Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.github.com/repos/{{ $env['GITHUB_OWNER'] }}/{{ $env['GITHUB_REPO'] }}/contents/docs/adr",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $json.token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "list-adrs",
+      "name": "List ADRs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.github.com/repos/{{ $env['GITHUB_OWNER'] }}/{{ $env['GITHUB_REPO'] }}/contents/docs/adr/template.md",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Get Installation Token').first().json.token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "read-template",
+      "name": "Read Template",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Numbering: max(NNNN-) + 1, zero-padded to 4 (excludes template.md by regex).\n// Slug: lowercase, [a-z0-9-]+, capped at 60 to keep branch refs under git's 255-char limit.\n// Template substitution: plain String.replace on the four MADR placeholders — no markdown parsing.\nconst listing = $('List ADRs').first().json;\nif (!Array.isArray(listing)) throw new Error('List ADRs response is not an array — fail-closed');\nconst nums = listing\n  .map((e) => (e?.name ?? '').match(/^(\\d{4})-/))\n  .filter(Boolean)\n  .map((m) => parseInt(m[1], 10));\nconst nextNum = (nums.length ? Math.max(...nums) : 0) + 1;\nconst nnnn = String(nextNum).padStart(4, '0');\n\nconst meta = $('Compute Skills Router HMAC').first().json._meta;\nconst title = meta.title;\nconst context = meta.context;\nconst slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);\nif (!slug) throw new Error('Title slug is empty after sanitization — fail-closed');\n\nconst tplResp = $('Read Template').first().json;\nif (!tplResp?.content) throw new Error('Template content missing — fail-closed');\nconst tpl = Buffer.from(tplResp.content, 'base64').toString('utf8');\nconst today = new Date().toISOString().slice(0, 10);\nconst rendered = tpl\n  .replace('# ADR-NNNN: [Title]', '# ADR-' + nnnn + ': ' + title)\n  .replace('**Date:** YYYY-MM-DD', '**Date:** ' + today)\n  .replace(/\\*\\*Status:\\*\\* \\[Proposed[^\\]]*\\]/, '**Status:** Proposed')\n  .replace(/\\[Describe the architectural context[^\\]]*\\]/, context);\n\nconst path = 'docs/adr/' + nnnn + '-' + slug + '.md';\nconst branch = 'claude/adr-' + nnnn + '-' + slug;\nconst contentB64 = Buffer.from(rendered, 'utf8').toString('base64');\n\nreturn [{ json: { _nnnn: nnnn, _slug: slug, _title: title, _context: context, _path: path, _branch: branch, _contentB64: contentB64 } }];"
+      },
+      "id": "build-plan",
+      "name": "Build ADR + Branch Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.github.com/repos/{{ $env['GITHUB_OWNER'] }}/{{ $env['GITHUB_REPO'] }}/git/ref/heads/{{ $env['GITHUB_BASE_BRANCH'] || 'main' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Get Installation Token').first().json.token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "get-base-sha",
+      "name": "Get Base SHA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2440, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $env['GITHUB_OWNER'] }}/{{ $env['GITHUB_REPO'] }}/git/refs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Get Installation Token').first().json.token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ ref: 'refs/heads/' + $('Build ADR + Branch Plan').first().json._branch, sha: $json.object.sha }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "create-branch",
+      "name": "Create Branch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2660, 200]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.github.com/repos/{{ $env['GITHUB_OWNER'] }}/{{ $env['GITHUB_REPO'] }}/contents/{{ $('Build ADR + Branch Plan').first().json._path }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Get Installation Token').first().json.token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ message: 'feat(adr): scaffold ADR-' + $('Build ADR + Branch Plan').first().json._nnnn + ' ' + $('Build ADR + Branch Plan').first().json._title, content: $('Build ADR + Branch Plan').first().json._contentB64, branch: $('Build ADR + Branch Plan').first().json._branch }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "commit-file",
+      "name": "Commit File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2880, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $env['GITHUB_OWNER'] }}/{{ $env['GITHUB_REPO'] }}/pulls",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $('Get Installation Token').first().json.token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ title: 'ADR-' + $('Build ADR + Branch Plan').first().json._nnnn + ': ' + $('Build ADR + Branch Plan').first().json._title, head: $('Build ADR + Branch Plan').first().json._branch, base: ($env['GITHUB_BASE_BRANCH'] || 'main'), body: '## Context\\n\\n' + $('Build ADR + Branch Plan').first().json._context + '\\n\\n---\\n\\nScaffolded by the create-adr n8n workflow. Reviewer: please fill in the remaining MADR sections (Decision Drivers, Considered Options, Decision Outcome, Validation, Links) before merge.', draft: false }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "open-pr",
+      "name": "Open PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3100, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const pr = $input.first().json;\nconst plan = $('Build ADR + Branch Plan').first().json;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nconst url = pr?.html_url ?? '(URL missing in API response)';\nreturn [{ json: { chat_id, text: 'ADR-' + plan._nnnn + ' \"' + plan._title + '\" PR opened: ' + url } }];"
+      },
+      "id": "format-success",
+      "name": "Format Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3320, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nlet reason;\nif (r?.status === 'pending_approval') {\n  reason = 'pending_approval (' + (r.reason ?? 'requires_approval') + ')';\n} else if (r?.matched === false) {\n  reason = 'no skill matched';\n} else if (r?.skill && r.skill !== 'create-adr') {\n  reason = 'router routed to a different skill: ' + r.skill;\n} else {\n  reason = 'unexpected router response';\n}\nreturn [{ json: { chat_id, text: 'Create ADR not executed — ' + reason } }];"
+      },
+      "id": "format-deny",
+      "name": "Format Deny",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.chat_id }}" },
+            { "name": "text", "value": "={{ $json.text }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "reply-telegram",
+      "name": "Reply to Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3540, 300]
+    }
+  ],
+  "connections": {
+    "Create ADR Webhook": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[
+        { "node": "Respond 200 OK", "type": "main", "index": 0 },
+        { "node": "Compute Skills Router HMAC", "type": "main", "index": 0 }
+      ]]
+    },
+    "Compute Skills Router HMAC": {
+      "main": [[{ "node": "Call Skills Router", "type": "main", "index": 0 }]]
+    },
+    "Call Skills Router": {
+      "main": [[{ "node": "Routing Gate", "type": "main", "index": 0 }]]
+    },
+    "Routing Gate": {
+      "main": [
+        [{ "node": "Build JWT", "type": "main", "index": 0 }],
+        [{ "node": "Format Deny", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build JWT": {
+      "main": [[{ "node": "Get Installation Token", "type": "main", "index": 0 }]]
+    },
+    "Get Installation Token": {
+      "main": [[{ "node": "List ADRs", "type": "main", "index": 0 }]]
+    },
+    "List ADRs": {
+      "main": [[{ "node": "Read Template", "type": "main", "index": 0 }]]
+    },
+    "Read Template": {
+      "main": [[{ "node": "Build ADR + Branch Plan", "type": "main", "index": 0 }]]
+    },
+    "Build ADR + Branch Plan": {
+      "main": [[{ "node": "Get Base SHA", "type": "main", "index": 0 }]]
+    },
+    "Get Base SHA": {
+      "main": [[{ "node": "Create Branch", "type": "main", "index": 0 }]]
+    },
+    "Create Branch": {
+      "main": [[{ "node": "Commit File", "type": "main", "index": 0 }]]
+    },
+    "Commit File": {
+      "main": [[{ "node": "Open PR", "type": "main", "index": 0 }]]
+    },
+    "Open PR": {
+      "main": [[{ "node": "Format Success", "type": "main", "index": 0 }]]
+    },
+    "Format Success": {
+      "main": [[{ "node": "Reply to Telegram", "type": "main", "index": 0 }]]
+    },
+    "Format Deny": {
+      "main": [[{ "node": "Reply to Telegram", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Real handler. Pattern mirrors health-check.json (PR #10): webhook → HMAC validate (R-02 fail-closed) → Respond 200 in parallel → ADR-0003 sign → Call Skills Router → Routing Gate IF (skill==='create-adr' && status!=='pending_approval') → GitHub-App branch (Build JWT → Get Installation Token → List ADRs → Read Template → Build ADR + Branch Plan → Get Base SHA → Create Branch → Commit File → Open PR ready-for-review) → Telegram reply. Required env vars: CREATE_ADR_WEBHOOK_SECRET, SKILLS_ROUTER_URL, SKILLS_ROUTER_SECRET, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY (PEM, multi-line), GITHUB_APP_INSTALLATION_ID, GITHUB_OWNER, GITHUB_REPO, GITHUB_BASE_BRANCH (default 'main'), TELEGRAM_BOT_TOKEN. Numbering reads docs/adr/ via the Contents API (max(NNNN-)+1, zero-padded); slug is [a-z0-9-] capped at 60 chars; template substitution is plain String.replace on the four MADR placeholders. Inbound payload contract: { title: string, context: string, chat_id: number|string, user_id?: number|string }."
+}

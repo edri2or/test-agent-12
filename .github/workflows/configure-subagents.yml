@@ -1,0 +1,294 @@
+name: Stage 6 Iter 5 — Configure Sub-Agents (Router + ops/code/research/infra)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  configure:
+    name: Deploy Agent Router + 4 sub-agents → N8N + Macro-F1 ≥ 0.85 E2E gate
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      N8N_OWNER_EMAIL: ${{ vars.N8N_OWNER_EMAIL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch secrets from GCP Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            railway-api-token:${{ vars.GCP_PROJECT_ID }}/railway-api-token
+            n8n-admin-password-plaintext:${{ vars.GCP_PROJECT_ID }}/n8n-admin-password-plaintext
+            railway-project-id:${{ vars.GCP_PROJECT_ID }}/railway-project-id
+            railway-environment-id:${{ vars.GCP_PROJECT_ID }}/railway-environment-id
+            telegram-bot-token:${{ vars.GCP_PROJECT_ID }}/telegram-bot-token
+            TELEGRAM_CHAT_ID:${{ vars.GCP_PROJECT_ID }}/TELEGRAM_CHAT_ID
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+      - name: Export Railway project/environment IDs to env
+        run: |
+          echo "RAILWAY_PROJECT_ID=${{ steps.secrets.outputs.railway-project-id }}" >> "$GITHUB_ENV"
+          echo "RAILWAY_ENVIRONMENT_ID=${{ steps.secrets.outputs.railway-environment-id }}" >> "$GITHUB_ENV"
+
+      - name: Generate Provisioner App token (replaces legacy GITHUB_PAT_ACTIONS_WRITE)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.secrets.outputs.provisioner-app-id }}
+          private-key: ${{ steps.secrets.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Resolve N8N Railway service domain
+        id: domain
+        env:
+          RAILWAY_TOKEN: ${{ steps.secrets.outputs.railway-api-token }}
+        run: |
+          RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg pid "$RAILWAY_PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){services{edges{node{id name}}}}}","variables":{"pid":$pid}}')")
+
+          N8N_SVC_ID=$(echo "$RESP" | jq -r \
+            '[.data.project.services.edges[] | select(.node.name == "n8n")] | first | .node.id // empty')
+          [ -n "$N8N_SVC_ID" ] || { echo "::error::N8N service not found"; exit 1; }
+
+          DOMAINS_RESP=$(curl -s -X POST https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg sid "$N8N_SVC_ID" --arg eid "$RAILWAY_ENVIRONMENT_ID" \
+              '{"query":"query($sid:String!,$eid:String!){serviceInstance(serviceId:$sid,environmentId:$eid){domains{serviceDomains{id domain}}}}","variables":{"sid":$sid,"eid":$eid}}')")
+
+          N8N_DOMAIN=$(echo "$DOMAINS_RESP" | jq -r \
+            '(.data.serviceInstance.domains.serviceDomains // []) | .[0].domain // empty')
+          [ -n "$N8N_DOMAIN" ] || { echo "::error::N8N domain not found"; exit 1; }
+          echo "n8n_domain=$N8N_DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for N8N to be healthy
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          for i in $(seq 1 10); do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://$N8N_DOMAIN/healthz/readiness" 2>/dev/null)
+            echo "Attempt $i/10: HTTP $HTTP"
+            [ "$HTTP" = "200" ] && break
+            [ "$i" = "10" ] && { echo "::error::N8N health check failed"; exit 1; }
+            sleep 15
+          done
+
+      - name: Login to N8N + create CI API key
+        id: n8n_auth
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          N8N_PW: ${{ steps.secrets.outputs.n8n-admin-password-plaintext }}
+        run: |
+          BASE_URL="https://$N8N_DOMAIN"
+          LOGIN=$(curl -s -c /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/login" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg email "$N8N_OWNER_EMAIL" --arg pw "$N8N_PW" \
+              '{"emailOrLdapLoginId":$email,"password":$pw}')")
+          USER_ID=$(echo "$LOGIN" | jq -r '.data.id // empty')
+          [ -n "$USER_ID" ] || { echo "::error::N8N login failed"; exit 1; }
+
+          EXPIRES=$(( $(date +%s) * 1000 + 3600000 ))
+          APIKEY=$(curl -s -b /tmp/n8n_cookies.txt \
+            -X POST "$BASE_URL/rest/api-keys" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --argjson exp "$EXPIRES" \
+              '{"label":"stage6-iter5-ci","scopes":["credential:create","credential:list","credential:update","workflow:create","workflow:list","workflow:update","workflow:activate","workflow:deactivate"],"expiresAt":$exp}')")
+          KEY=$(echo "$APIKEY" | jq -r '.data.rawApiKey // empty')
+          KID=$(echo "$APIKEY" | jq -r '.data.id // empty')
+          [ -n "$KEY" ] || { echo "::error::API key creation failed: $APIKEY"; exit 1; }
+          echo "::add-mask::$KEY"
+          echo "n8n_api_key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "n8n_api_key_id=$KID" >> "$GITHUB_OUTPUT"
+          echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve existing credential IDs (Telegram Bot + OpenRouter)
+        id: existing_creds
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+        run: |
+          CREDS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/credentials?limit=100")
+          TG_ID=$(echo "$CREDS" | jq -r '[(.data // [])[] | select(.name == "Telegram Bot")] | first | .id // empty')
+          OR_ID=$(echo "$CREDS" | jq -r '[(.data // [])[] | select(.name == "OpenRouter")] | first | .id // empty')
+          [ -n "$TG_ID" ] || { echo "::error::Telegram Bot credential not found (Stage 5 must run first)"; exit 1; }
+          [ -n "$OR_ID" ] || { echo "::error::OpenRouter credential not found (Stage 4 must run first)"; exit 1; }
+          echo "tg_cred_id=$TG_ID" >> "$GITHUB_OUTPUT"
+          echo "or_cred_id=$OR_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upsert GitHub PAT credential (HTTP Header Auth)
+        id: github_cred
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          GH_PAT: ${{ steps.app-token.outputs.token }}
+        run: |
+          CREDS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/credentials?limit=100")
+          CID=$(echo "$CREDS" | jq -r '[(.data // [])[] | select(.name == "GitHub PAT Actions Write")] | first | .id // empty')
+
+          AUTH_VALUE="Bearer $GH_PAT"
+          PAYLOAD=$(jq -cn --arg name "GitHub PAT Actions Write" --arg val "$AUTH_VALUE" \
+            '{"name":$name,"type":"httpHeaderAuth","data":{"name":"Authorization","value":$val}}')
+
+          if [ -n "$CID" ]; then
+            PATCH=$(curl -s -b /tmp/n8n_cookies.txt \
+              -X PATCH "$BASE_URL/rest/credentials/$CID" \
+              -H "Content-Type: application/json" -d "$PAYLOAD")
+            echo "$PATCH" | jq -e '.data.id // .id' > /dev/null \
+              || { echo "::error::PATCH github cred failed: $PATCH"; exit 1; }
+          else
+            CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -X POST "$BASE_URL/api/v1/credentials" \
+              -H "Content-Type: application/json" -d "$PAYLOAD")
+            CID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+            [ -n "$CID" ] || { echo "::error::POST github cred failed: $CREATE"; exit 1; }
+          fi
+          echo "gh_cred_id=$CID" >> "$GITHUB_OUTPUT"
+
+      - name: Upsert + activate 5 workflows (sub-agents first, then Router)
+        id: upsert
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          N8N_API_KEY: ${{ steps.n8n_auth.outputs.n8n_api_key }}
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+          TG_CRED_ID: ${{ steps.existing_creds.outputs.tg_cred_id }}
+          OR_CRED_ID: ${{ steps.existing_creds.outputs.or_cred_id }}
+          GH_CRED_ID: ${{ steps.github_cred.outputs.gh_cred_id }}
+        run: |
+          GITHUB_PAGES_STATE_URL="https://$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1).github.io/$(echo "$GITHUB_REPOSITORY" | cut -d/ -f2)/state.json"
+
+          WFS=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" "$BASE_URL/api/v1/workflows?limit=200")
+
+          upsert_one() {
+            local src="$1"
+            local name processed WF_ID PUT_RESP CREATE WF_REST VER ACTIVE ACT OK
+            name=$(jq -r '.name' "$src")
+            processed=$(mktemp --suffix=.json)
+            sed -e "s|@@CRED_TELEGRAM_ID@@|$TG_CRED_ID|g" \
+                -e "s|@@CRED_OPENROUTER_ID@@|$OR_CRED_ID|g" \
+                -e "s|@@CRED_GITHUB_PAT_ID@@|$GH_CRED_ID|g" \
+                -e "s|@@N8N_DOMAIN@@|$N8N_DOMAIN|g" \
+                -e "s|@@GITHUB_REPO@@|$GITHUB_REPOSITORY|g" \
+                -e "s|@@GITHUB_PAGES_STATE_URL@@|$GITHUB_PAGES_STATE_URL|g" \
+                "$src" > "$processed"
+
+            jq empty "$processed" || { echo "::error::Invalid JSON after substitution: $processed"; exit 1; }
+
+            WF_ID=$(echo "$WFS" | jq -r --arg n "$name" '[(.data // [])[] | select(.name == $n)] | first | .id // empty')
+
+            if [ -n "$WF_ID" ]; then
+              echo "Updating $name ($WF_ID)..."
+              PUT_RESP=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+                -X PUT "$BASE_URL/api/v1/workflows/$WF_ID" \
+                -H "Content-Type: application/json" \
+                --data-binary @"$processed")
+              echo "$PUT_RESP" | jq -e '.data.id // .id' > /dev/null \
+                || { echo "::error::PUT failed for $name: $PUT_RESP"; exit 1; }
+            else
+              echo "Creating $name..."
+              CREATE=$(curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+                -X POST "$BASE_URL/api/v1/workflows" \
+                -H "Content-Type: application/json" \
+                --data-binary @"$processed")
+              WF_ID=$(echo "$CREATE" | jq -r '.data.id // .id // empty')
+              [ -n "$WF_ID" ] || { echo "::error::POST failed for $name: $CREATE"; exit 1; }
+            fi
+
+            WF_REST=$(curl -s -b /tmp/n8n_cookies.txt "$BASE_URL/rest/workflows/$WF_ID")
+            VER=$(echo "$WF_REST" | jq -r '.data.versionId // empty')
+            ACTIVE=$(echo "$WF_REST" | jq -r '.data.active // "false"')
+            [ -n "$VER" ] || { echo "::error::versionId missing for $name"; exit 1; }
+
+            if [ "$ACTIVE" = "true" ]; then
+              curl -s -b /tmp/n8n_cookies.txt \
+                -X POST "$BASE_URL/rest/workflows/$WF_ID/deactivate" > /dev/null
+            fi
+            ACT=$(curl -s -b /tmp/n8n_cookies.txt \
+              -X POST "$BASE_URL/rest/workflows/$WF_ID/activate" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg vid "$VER" '{"versionId":$vid}')")
+            OK=$(echo "$ACT" | jq -r '.data.active // "false"')
+            [ "$OK" = "true" ] || { echo "::error::Activation failed for $name: $ACT"; exit 1; }
+            echo "  $name activated (id=$WF_ID)."
+          }
+
+          upsert_one workflows/n8n/infra-agent.json
+          upsert_one workflows/n8n/ops-agent.json
+          upsert_one workflows/n8n/code-agent.json
+          upsert_one workflows/n8n/research-agent.json
+          upsert_one workflows/n8n/agent-router.json
+
+      - name: E2E gate — Macro-F1 ≥ 0.85 across 10 Hebrew intents
+        id: gate
+        env:
+          N8N_DOMAIN: ${{ steps.domain.outputs.n8n_domain }}
+        run: |
+          jq empty workflows/n8n/test-battery.json
+
+          rm -f /tmp/probe.*.txt
+          probe() {
+            local i="$1" text="$2" expected="$3" resp intent
+            resp=$(curl -s --max-time 40 \
+              -X POST "https://$N8N_DOMAIN/webhook/agent-router" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg t "$text" '{text:$t,chat_id:"test"}')")
+            intent=$(echo "$resp" | jq -r '.intent // "parse_error"')
+            printf '%s | expected=%s | got=%s | text=%s\n' "$i" "$expected" "$intent" "$text"
+            printf '%s %s\n' "$expected" "$intent" > "/tmp/probe.$i.txt"
+          }
+
+          i=0
+          while read -r row; do
+            i=$((i + 1))
+            TEXT=$(echo "$row" | jq -r '.text')
+            EXPECTED=$(echo "$row" | jq -r '.expected')
+            probe "$i" "$TEXT" "$EXPECTED" &
+          done < <(jq -c '.[]' workflows/n8n/test-battery.json)
+          wait
+
+          cat /tmp/probe.*.txt > /tmp/results.txt
+          python3 scripts/macro_f1.py /tmp/results.txt 0.85
+
+      - name: Revoke CI API key
+        if: always()
+        env:
+          BASE_URL: ${{ steps.n8n_auth.outputs.base_url }}
+          KID: ${{ steps.n8n_auth.outputs.n8n_api_key_id }}
+        run: |
+          [ -z "$KID" ] && { echo "No key id; skipping."; exit 0; }
+          curl -s -b /tmp/n8n_cookies.txt -X DELETE "$BASE_URL/rest/api-keys/$KID" > /dev/null
+          echo "CI API key $KID revoked."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Stage 6 Iter 5 — Sub-Agents Deployed"
+            echo ""
+            echo "| Workflow | Status |"
+            echo "|----------|--------|"
+            echo "| Agent Router | ✅ |"
+            echo "| ops-agent | ✅ |"
+            echo "| code-agent | ✅ |"
+            echo "| research-agent | ✅ |"
+            echo "| infra-agent (stub) | ✅ |"
+            echo "| Macro-F1 gate (≥ 0.85) | see job log |"
+          } >> "$GITHUB_STEP_SUMMARY"

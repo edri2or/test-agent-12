@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-02
+  description: "Test agent — validates fixed GitHub App 2-click flow (PR #92)"
+spec:
+  gcp:
+    projectId: or-test-agent-02
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-02
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-02.or-infra.com
+    worker:
+      name: test-agent-02-edge
+      route: test-agent-02.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "test agent — validates fixed GitHub App 2-click flow with auto installation_id capture"

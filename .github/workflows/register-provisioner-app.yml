@@ -1,0 +1,277 @@
+name: Register Provisioner GitHub App
+
+# One-time workflow: deploys a Cloud Run receiver to register the
+# `autonomous-agent-provisioner-v2` GitHub App for the edri2or org.
+# (v2 because the original `autonomous-agent-provisioner` App exists on GitHub
+# but its private key was lost during a failed SM write — see JOURNEY.md 2026-05-03.
+# The partial SM state is cleaned up automatically before re-registration.)
+#
+# Run once globally — after this workflow completes successfully, the three
+# secrets provisioner-app-id, provisioner-app-private-key, and
+# provisioner-app-installation-id will exist in or-infra-templet-admin SM.
+#
+# Prerequisites (all pre-existing on this repo):
+#   GitHub VARIABLES: GCP_PROJECT_ID, GCP_WORKLOAD_IDENTITY_PROVIDER,
+#                     GCP_SERVICE_ACCOUNT_EMAIL, GCP_REGION
+#
+# Human actions required (ADR-0014 vendor floor):
+#   1. Open the URL printed in the Step Summary → click "Create GitHub App"
+#   2. On the next page, click "Install" and select "All repositories"
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_reregister:
+        description: 'Force re-registration even if provisioner-app-* secrets already exist (use to update App permissions)'
+        type: boolean
+        default: false
+      app_name:
+        description: 'GitHub App name to register. Must differ from any existing App name in the org. Default: autonomous-agent-provisioner-v2. Use autonomous-agent-provisioner-v3 (or higher) when force_reregistering — GitHub rejects duplicate names.'
+        type: string
+        default: 'autonomous-agent-provisioner-v2'
+
+permissions:
+  contents: read
+  id-token: write   # Required for WIF authentication to GCP
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION:     ${{ vars.GCP_REGION || 'us-central1' }}
+  SERVICE_NAME:   provisioner-app-receiver
+
+jobs:
+  register-provisioner-app:
+    name: Register ${{ inputs.app_name || 'autonomous-agent-provisioner-v2' }} App (2-click)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Check if Provisioner App secrets already exist
+        id: check-secrets
+        run: |
+          # Gate on both unrecoverable secrets: private-key (returned once by GitHub
+          # during manifest exchange) and installation-id (last written in the flow).
+          # A half-written run could leave one without the other.
+          # force_reregister=true bypasses the check to update App permissions.
+          if [ "${{ inputs.force_reregister }}" = "true" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️  force_reregister=true — bypassing existence check to update App permissions."
+          else
+            have_key=false; have_install=false
+            gcloud secrets versions access latest --secret=provisioner-app-private-key \
+              --project="${GCP_PROJECT_ID}" &>/dev/null && have_key=true
+            gcloud secrets versions access latest --secret=provisioner-app-installation-id \
+              --project="${GCP_PROJECT_ID}" &>/dev/null && have_install=true
+            if [ "$have_key" = "true" ] && [ "$have_install" = "true" ]; then
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "✅ All provisioner-app-* secrets present — skipping registration."
+            else
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "Missing secrets (key=$have_key install=$have_install) — proceeding."
+            fi
+          fi
+
+      - name: Clean up partial SM state from previous failed registration
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          # On force_reregister: delete ONLY provisioner-app-installation-id so the
+          # poll_secret step below is forced to wait for a new /install-callback write
+          # (instead of finding the existing secret immediately and returning early).
+          # provisioner-app-id and provisioner-app-private-key are kept intact so
+          # create-github-app-token@v1 callers continue to work during the window.
+          # The Cloud Run receiver adds new SM versions for all secrets after the 2
+          # clicks, so old versions are preserved in the version history.
+          # On normal re-registration (partial state): delete all cleanly.
+          if [ "${{ inputs.force_reregister }}" = "true" ]; then
+            for secret in provisioner-app-installation-id provisioner-app-webhook-secret; do
+              gcloud secrets delete "$secret" --project="${GCP_PROJECT_ID}" --quiet 2>/dev/null || true
+            done
+            echo "force_reregister: deleted installation-id + webhook-secret; id + private-key preserved for continuity."
+          else
+            for secret in provisioner-app-id provisioner-app-private-key provisioner-app-installation-id provisioner-app-webhook-secret; do
+              gcloud secrets delete "$secret" --project="${GCP_PROJECT_ID}" --quiet 2>/dev/null || true
+            done
+          fi
+
+      - name: Build and push receiver image
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          gcloud artifacts repositories create bootstrap-images \
+            --repository-format=docker \
+            --location="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet 2>/dev/null || true
+
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/bootstrap-images/receiver:latest"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+          docker build -t "${IMAGE}" src/bootstrap-receiver/
+          docker push "${IMAGE}"
+
+      - name: Grant runtime SA actAs on itself (Cloud Run deploy requirement)
+        if: steps.check-secrets.outputs.exists == 'false'
+        env:
+          SA_EMAIL: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+        run: |
+          gcloud iam service-accounts add-iam-policy-binding "${SA_EMAIL}" \
+            --member="serviceAccount:${SA_EMAIL}" \
+            --role="roles/iam.serviceAccountUser" \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet
+
+      - name: Deploy Cloud Run receiver (no redirect URL yet)
+        id: deploy
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          # "variables" and "actions" are NOT supported in the GitHub App manifest
+          # default_permissions field (they exist as App settings but GitHub's manifest
+          # validator rejects them with "Default permission records resource is not
+          # included in the list"). Omit them here; add via App settings UI after
+          # registration if needed (PATCH /app requires JWT auth + org approval click).
+          APP_PERMISSIONS_B64=$(printf '%s' '{"administration":"write","contents":"write","secrets":"write","workflows":"write","actions":"write","metadata":"read","organization_administration":"write"}' | base64 -w 0)
+
+          set +e
+          gcloud run deploy "${SERVICE_NAME}" \
+            --image="${IMAGE}" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --allow-unauthenticated \
+            --service-account="${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}" \
+            --set-env-vars="GCP_PROJECT_ID=${GCP_PROJECT_ID},GITHUB_ORG=${{ github.repository_owner }},APP_NAME=${{ inputs.app_name || 'autonomous-agent-provisioner-v4' }},SECRET_PREFIX=provisioner-app-,APP_PERMISSIONS=${APP_PERMISSIONS_B64},GITHUB_REPO=${{ github.repository }}" \
+            --quiet 2>&1 | tee /tmp/run_deploy.log
+          EC=${PIPESTATUS[0]}
+          if [ "$EC" -ne 0 ]; then
+            tail -40 /tmp/run_deploy.log | sed 's/\x1b\[[0-9;]*m//g' | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              clean="${line//$'\r'/}"
+              echo "::error::cloud-run-deploy: ${clean:0:300}"
+            done
+            exit "$EC"
+          fi
+
+          run_diag() {
+            local LABEL="$1"; shift
+            "$@" 2>&1 | tee /tmp/gcloud_step.log
+            local EC=${PIPESTATUS[0]}
+            if [ "$EC" -ne 0 ]; then
+              tail -25 /tmp/gcloud_step.log | sed 's/\x1b\[[0-9;]*m//g' | while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                clean="${line//$'\r'/}"
+                echo "::error::${LABEL}: ${clean:0:300}"
+              done
+              exit "$EC"
+            fi
+          }
+
+          SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+            --platform=managed --region="${GCP_REGION}" --project="${GCP_PROJECT_ID}" \
+            --format='value(status.url)')"
+          echo "SERVICE_URL=${SERVICE_URL}" >> "$GITHUB_ENV"
+
+          run_diag "services-update-redirect" gcloud run services update "${SERVICE_NAME}" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --update-env-vars="REDIRECT_URL=${SERVICE_URL}/callback" \
+            --quiet
+
+          run_diag "add-iam-policy-binding" gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --member=allUsers \
+            --role=roles/run.invoker \
+            --quiet
+
+      - name: Probe health endpoint
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          echo "Waiting for receiver to become healthy at ${SERVICE_URL}/health"
+          LAST_HTTP=""
+          LAST_BODY=""
+          for i in $(seq 1 24); do
+            RESP=$(curl -sS -m 8 -o /tmp/probe.body -w "%{http_code}" "${SERVICE_URL}/health" 2>&1)
+            LAST_HTTP="$RESP"
+            LAST_BODY=$(head -c 200 /tmp/probe.body 2>/dev/null)
+            if [ "$RESP" = "200" ]; then
+              echo "✅ Receiver healthy after ${i} attempt(s). body=${LAST_BODY}"
+              exit 0
+            fi
+            echo "  Attempt ${i}/24 — HTTP=${RESP} body=${LAST_BODY:0:80}"
+            sleep 5
+          done
+          echo "::error::Receiver health check failed after 120s — last HTTP=${LAST_HTTP} body=${LAST_BODY}"
+          exit 1
+
+      - name: Print operator instruction
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          echo "::notice::Operator URL — open in browser to register Provisioner GitHub App: ${SERVICE_URL}"
+          echo "## Provisioner GitHub App Registration — Human Action Required" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Open this URL in your browser** (you must be a GitHub org admin for edri2or):" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "👉 **[Start Provisioner App registration](${SERVICE_URL})**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The page auto-submits to GitHub. Click **\"Create GitHub App\"** — that's click 1." >> "$GITHUB_STEP_SUMMARY"
+          echo "On the next page, click **\"Install\"** and select **\"All repositories\"** — that's click 2." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "All credentials are written to GCP Secret Manager automatically:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`provisioner-app-id\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`provisioner-app-private-key\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`provisioner-app-installation-id\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_This job will poll for up to 10 minutes. After both clicks, the workflow continues automatically._" >> "$GITHUB_STEP_SUMMARY"
+
+          echo ""
+          echo "====================================================="
+          echo "ACTION REQUIRED: Open ${SERVICE_URL} in your browser."
+          echo "Click 'Create GitHub App', then 'Install' (select All repositories)."
+          echo "====================================================="
+
+      - name: Poll Secret Manager for provisioner-app-id + provisioner-app-installation-id (up to 10 min each)
+        if: steps.check-secrets.outputs.exists == 'false'
+        run: |
+          poll_secret() {
+            local secret="$1" label="$2" hint="$3"
+            echo "Polling for ${secret} (20 retries × 30s = 10 min max)..."
+            for i in $(seq 1 20); do
+              if gcloud secrets versions access latest \
+                  --secret="${secret}" \
+                  --project="${GCP_PROJECT_ID}" &>/dev/null 2>&1; then
+                echo "✅ ${label} after ${i} poll(s)."
+                return 0
+              fi
+              echo "  Poll ${i}/20 — waiting 30s..."
+              sleep 30
+            done
+            echo "❌ Timed out. ${hint}"
+            return 1
+          }
+          poll_secret "provisioner-app-id"             "Provisioner App registered" "Did you click 'Create GitHub App'?"
+          poll_secret "provisioner-app-installation-id" "Installation complete"      "Did GitHub redirect to /install-callback? Select 'All repositories' when prompted."
+
+      - name: Tear down Cloud Run receiver
+        if: always() && steps.check-secrets.outputs.exists == 'false'
+        run: |
+          echo "Deleting Cloud Run receiver service..."
+          gcloud run services delete "${SERVICE_NAME}" \
+            --platform=managed \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --quiet 2>/dev/null || true
+          echo "✅ Cloud Run receiver deleted."

@@ -1,0 +1,58 @@
+name: PR Discipline
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  current-focus-updated:
+    name: current-focus issue updated for this PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify issue is fresh and references this PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          ISSUE=$(gh api \
+            "repos/$GITHUB_REPOSITORY/issues?labels=current-focus&state=open&per_page=1")
+
+          read -r ISSUE_NUM ISSUE_UPDATED \
+            <<< "$(echo "$ISSUE" | jq -r '.[0] | "\(.number // "") \(.updated_at // "")"')"
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "No open current-focus issue found — skipping check."
+            exit 0
+          fi
+
+          ISSUE_BODY=$(echo "$ISSUE" | jq -r '.[0].body // ""')
+
+          FAILED=0
+
+          PR_OLDEST_COMMIT=$(git log --format="%cI" "origin/${BASE_REF}..HEAD" | tail -1)
+          ISSUE_EPOCH=$(date -d "$ISSUE_UPDATED" +%s 2>/dev/null || echo 0)
+          COMMIT_EPOCH=$(date -d "$PR_OLDEST_COMMIT" +%s 2>/dev/null || echo 0)
+
+          if [ "$COMMIT_EPOCH" -gt "$ISSUE_EPOCH" ]; then
+            echo "::error title=current-focus stale::Issue #${ISSUE_NUM} updated_at (${ISSUE_UPDATED}) is older than this PR's oldest commit (${PR_OLDEST_COMMIT}). Update the issue before merging."
+            FAILED=1
+          fi
+
+          if ! grep -qE "#${PR_NUMBER}([^0-9]|$)" <<< "$ISSUE_BODY"; then
+            echo "::error title=PR not referenced in issue::Issue #${ISSUE_NUM} does not mention PR #${PR_NUMBER}. Add a reference (e.g. 'PR #${PR_NUMBER} open for ...') to the issue body before merging."
+            FAILED=1
+          fi
+
+          [ "$FAILED" -eq 1 ] && exit 1
+
+          echo "current-focus issue #${ISSUE_NUM} is fresh and references PR #${PR_NUMBER} ✓"

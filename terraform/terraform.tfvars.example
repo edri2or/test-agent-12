@@ -1,0 +1,17 @@
+# terraform.tfvars.example
+# Copy to terraform.tfvars and fill in values.
+# NEVER commit terraform.tfvars — it is in .gitignore.
+
+gcp_project_id         = ""
+gcp_region             = "us-central1"
+github_org             = ""
+github_repo            = ""   # format: "org/repo"
+github_main_branch     = "main"
+wif_pool_id            = "github-pool"
+wif_provider_id        = "github-provider"
+service_account_id     = "github-actions-sa"
+cloudflare_zone_id     = ""
+cloudflare_domain      = ""
+clone_slug             = "agent"   # Per-clone slug, ADR-0011 §2. CI passes github.event.repository.name; override here for local plan/apply.
+railway_project_id     = ""
+terraform_state_bucket = ""   # GCS bucket name (must be globally unique)

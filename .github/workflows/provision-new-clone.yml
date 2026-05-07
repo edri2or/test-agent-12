@@ -1,0 +1,201 @@
+name: Provision new clone (ADR-0012)
+
+# ADR-0012 (ADR-0011 Phase E): GitHub-driven clone provisioning.
+#
+# Lifts the trigger surface for per-clone bootstrap from GCP Cloud Shell
+# (the original ADR-0011 §1 / Phase C path, validated live in Q-Path on
+# 2026-05-01) to a workflow_dispatch on this template-builder repo.
+#
+# Per-clone operator actions after Phase E lands: ZERO.
+# Per-clone Claude Code actions: dispatch this workflow with inputs.
+#
+# Required one-time-global operator pre-grants (§E.1) — performed once
+# for the entire org's clone lifecycle, NOT per clone:
+#   1. roles/resourcemanager.projectCreator + roles/resourcemanager.organizationViewer
+#      on org → github-actions-runner@or-infra-templet-admin
+#   2. roles/billing.user on billing account → same SA
+#   3. PAT (repo+workflow+admin:org) stored as `gh-admin-token` in
+#      or-infra-templet-admin GCP Secret Manager
+#   4. is_template=true on the source template repo (already done in Q-Path)
+#
+# Security: the existing WIF provider's attributeCondition restricts SA
+# impersonation to assertion.repository == 'edri2or/autonomous-agent-template-builder'.
+# Org-level role expansion blast radius is bounded to compromise of this
+# specific repo's CI. Every project creation appears in this repo's
+# workflow run history (audit trail).
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_repo_name:
+        description: 'New repo name (e.g. autonomous-agent-foo)'
+        required: true
+      new_project_id:
+        description: 'New GCP project ID (must be globally unique, ≤30 chars)'
+        required: true
+      parent_folder_id:
+        description: 'GCP folder ID where the new project will be created'
+        required: true
+        default: '667201164106'
+      billing_account_id:
+        description: 'GCP billing account to link'
+        required: true
+        default: '014D0F-AC8E0F-5A7EE7'
+      github_owner:
+        description: 'GitHub org/user that will own the new repo'
+        required: true
+        default: 'edri2or'
+  # Reusable-workflow surface for apply-system-spec.yml (Phase 2, ADR-0013):
+  # callers depend on this via `needs:` so Railway + Cloudflare provider
+  # sub-workflows can run only after the GCP project + GitHub repo exist.
+  workflow_call:
+    inputs:
+      new_repo_name:
+        type: string
+        required: true
+      new_project_id:
+        type: string
+        required: true
+      parent_folder_id:
+        type: string
+        required: false
+        default: '667201164106'
+      billing_account_id:
+        type: string
+        required: false
+        default: '014D0F-AC8E0F-5A7EE7'
+      github_owner:
+        type: string
+        required: false
+        default: 'edri2or'
+
+permissions:
+  contents: read
+  id-token: write   # WIF token exchange
+
+jobs:
+  provision:
+    name: Provision new clone
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout template-builder
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Create new GitHub repo from template (idempotent)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          OWNER="${{ inputs.github_owner }}"
+          NAME="${{ inputs.new_repo_name }}"
+          # Idempotency: skip if the target repo already exists. The template
+          # generate endpoint returns 422 on collision, which would abort a
+          # retry of a partial-state provisioning run (e.g. run 25254068938
+          # where billing-link succeeded on the second pass but this step
+          # then re-tried `repos/X/generate` against an already-existing
+          # `edri2or/hello-world-agent`). Per ADR-0007 idempotency principle.
+          if gh api "repos/$OWNER/$NAME" >/dev/null 2>&1; then
+            echo "::notice::Repo $OWNER/$NAME already exists — skipping template generate (idempotent)"
+          else
+            gh api -X POST "repos/${{ github.repository }}/generate" \
+              -f name="$NAME" \
+              -f owner="$OWNER" \
+              -F private=false \
+              -f description="Auto-provisioned by ADR-0012 from autonomous-agent-template-builder"
+            echo "::notice::Created $OWNER/$NAME from template"
+          fi
+
+      # Wait for GitHub's App installation to propagate to the new repo before
+      # generating the token. GitHub needs ~15-30s to update the installation's
+      # repository list after a new repo is created in the org. Without this
+      # sleep, even a freshly-minted token may not cover the new repo yet.
+      - name: Wait for App installation propagation
+        run: sleep 30
+
+      # Regenerate the App token AFTER repo creation. Scope explicitly to the
+      # new repo so GitHub resolves the installation against a specific repo
+      # rather than the full org list (which may be stale). Combined with the
+      # sleep above this reliably covers the propagation window.
+      - name: Refresh GitHub App token (post repo-creation)
+        id: app-token-post-create
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.new_repo_name }}
+
+      - name: Run grant-autonomy.sh against the new project (CI-WIF mode)
+        env:
+          CI: 'true'
+          GH_TOKEN: ${{ steps.app-token-post-create.outputs.token }}
+          GITHUB_REPO: ${{ inputs.github_owner }}/${{ inputs.new_repo_name }}
+          GCP_PROJECT_ID: ${{ inputs.new_project_id }}
+          GCP_PARENT_FOLDER: ${{ inputs.parent_folder_id }}
+          GCP_BILLING_ACCOUNT: ${{ inputs.billing_account_id }}
+          # Source secrets from this template-builder's GCP project, sync
+          # into the new repo's GitHub Secrets (per grant-autonomy.sh §E.2
+          # SECRETS_SOURCE_PROJECT decoupling).
+          SECRETS_SOURCE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+        run: bash tools/grant-autonomy.sh
+
+      - name: Copy Provisioner App credentials to clone's Secret Manager
+        env:
+          PROVISIONER_APP_ID:      ${{ steps.provisioner.outputs.provisioner-app-id }}
+          PROVISIONER_APP_KEY:     ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          CLONE_PROJECT:           ${{ inputs.new_project_id }}
+        run: |
+          set -euo pipefail
+          # bootstrap.yml Phase 5 reads provisioner-app-id + provisioner-app-private-key
+          # from the clone's own SM to generate an App token for dispatching deploy.yml.
+          upsert() {
+            local name="$1" value="$2"
+            printf '%s' "$value" | \
+              gcloud secrets create "$name" --project="${CLONE_PROJECT}" \
+                --replication-policy=automatic --data-file=- 2>/dev/null \
+            || printf '%s' "$value" | \
+              gcloud secrets versions add "$name" --project="${CLONE_PROJECT}" --data-file=-
+            echo "::notice::${name} written to ${CLONE_PROJECT}"
+          }
+          upsert provisioner-app-id          "$PROVISIONER_APP_ID"
+          upsert provisioner-app-private-key "$PROVISIONER_APP_KEY"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Clone provisioned"
+            echo
+            echo "- New repo: \`${{ inputs.github_owner }}/${{ inputs.new_repo_name }}\`"
+            echo "- New GCP project: \`${{ inputs.new_project_id }}\`"
+            echo "- Parent folder: \`${{ inputs.parent_folder_id }}\`"
+            echo "- Billing account: \`${{ inputs.billing_account_id }}\`"
+            echo
+            echo "## Next: Path D activation"
+            echo
+            echo "Provisioning is complete. Activation (R-04 Telegram, R-07 GitHub App, R-10 Linear) is NOT — see \`docs/runbooks/bootstrap.md\` Path D for the 5-step sequence and success criteria."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,111 @@
+name: Create Railway service domains
+
+on:
+  workflow_dispatch:
+    inputs:
+      clone_project_id:
+        description: GCP project ID of the clone
+        required: true
+        default: or-test-agent-05
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  create-domains:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create domains for n8n and agent services
+        env:
+          CLONE_PROJECT: ${{ inputs.clone_project_id }}
+        run: |
+          TOKEN=$(gcloud secrets versions access latest \
+            --secret=railway-api-token --project="$CLONE_PROJECT")
+          ENV_ID=$(gcloud secrets versions access latest \
+            --secret=railway-environment-id --project="$CLONE_PROJECT" 2>/dev/null || true)
+          N8N=$(gcloud secrets versions access latest \
+            --secret=railway-n8n-service-id --project="$CLONE_PROJECT" 2>/dev/null || true)
+          AGT=$(gcloud secrets versions access latest \
+            --secret=railway-agent-service-id --project="$CLONE_PROJECT" 2>/dev/null || true)
+
+          echo "::notice::env_id=${ENV_ID}"
+          echo "::notice::n8n_service_id=${N8N}"
+          echo "::notice::agent_service_id=${AGT}"
+
+          railway_gql() {
+            local QUERY="$1"
+            local VARS="$2"
+            printf '{"query":%s,"variables":%s}' \
+              "$(echo "$QUERY" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')" \
+              "${VARS}" > /tmp/gql_req.json
+            curl -sf -X POST https://backboard.railway.app/graphql/v2 \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "User-Agent: autonomous-agent/1.0" \
+              --data @/tmp/gql_req.json 2>/dev/null || echo '{}'
+          }
+
+          get_domain() {
+            local SVC_ID="$1"
+            RESP=$(railway_gql \
+              'query ServiceDomain($id: String!) { service(id: $id) { serviceInstances { edges { node { domains { serviceDomains { domain } } } } } } }' \
+              "{\"id\":\"${SVC_ID}\"}")
+            ERRS=$(echo "${RESP}" | python3 -c "import sys,json; d=json.load(sys.stdin); errs=d.get('errors'); print(errs if errs else 'none')" 2>/dev/null || echo 'parse-fail')
+            [ "${ERRS}" != "none" ] && echo "::warning::query errors for ${SVC_ID}: ${ERRS}"
+            echo "${RESP}" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          edges=((d.get('data') or {}).get('service') or {}).get('serviceInstances',{}).get('edges',[])
+          for e in edges:
+            sds=(e.get('node') or {}).get('domains',{}).get('serviceDomains',[])
+            if sds:
+              print(sds[0]['domain'])
+              sys.exit(0)
+          print('NO_DOMAIN')
+          " 2>/dev/null || echo 'PARSE_ERROR'
+          }
+
+          create_domain() {
+            local SVC_ID="$1"
+            RESP=$(railway_gql \
+              'mutation CreateDomain($input: ServiceDomainCreateInput!) { serviceDomainCreate(input: $input) { id domain } }' \
+              "{\"input\":{\"serviceId\":\"${SVC_ID}\",\"environmentId\":\"${ENV_ID}\"}}")
+            ERRS=$(echo "${RESP}" | python3 -c "import sys,json; d=json.load(sys.stdin); errs=d.get('errors'); print(errs if errs else 'none')" 2>/dev/null || echo 'parse-fail')
+            [ "${ERRS}" != "none" ] && echo "::warning::create errors for ${SVC_ID}: ${ERRS}"
+            echo "${RESP}" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          cd=((d.get('data') or {}).get('serviceDomainCreate') or {})
+          print(cd.get('domain','CREATE_FAILED'))
+          " 2>/dev/null || echo 'PARSE_ERROR'
+          }
+
+          for LABEL_SVC in "n8n:${N8N}" "agent:${AGT}"; do
+            LABEL="${LABEL_SVC%%:*}"
+            SVC_ID="${LABEL_SVC##*:}"
+            [ -z "${SVC_ID}" ] && continue
+
+            EXISTING=$(get_domain "${SVC_ID}")
+            echo "::notice::${LABEL} query result=${EXISTING}"
+            if [ "${EXISTING}" != "NO_DOMAIN" ] && [ "${EXISTING}" != "PARSE_ERROR" ]; then
+              echo "::notice::${LABEL}_domain=${EXISTING}"
+              continue
+            fi
+
+            DOMAIN=$(create_domain "${SVC_ID}")
+            if [ "${DOMAIN}" = "CREATE_FAILED" ] || [ "${DOMAIN}" = "PARSE_ERROR" ]; then
+              echo "::error::${LABEL} domain creation failed (see warnings above for GraphQL errors)"
+            else
+              echo "::notice::${LABEL}_domain=${DOMAIN}"
+            fi
+          done

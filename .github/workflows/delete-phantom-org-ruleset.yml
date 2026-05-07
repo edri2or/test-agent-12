@@ -1,0 +1,157 @@
+name: Delete phantom org ruleset
+
+# Dispatched after update-provisioner-app-permissions.yml has run AND the
+# org owner has approved the organization_administration:write permission.
+#
+# This workflow:
+#   1. Uses the Provisioner App installation token (which now has
+#      organization_administration:write) to list all org rulesets.
+#   2. Identifies any ruleset referencing bootstrap.yml or
+#      bootstrap-dispatch.yml as a required workflow.
+#   3. Deletes it via DELETE /orgs/{org}/rulesets/{id}.
+#
+# Expected outcome: no more phantom push runs on bootstrap-dispatch.yml
+# or bootstrap.yml after the next push to any branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — list rulesets but do not delete'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  contents: read
+  id-token: write   # WIF token exchange
+
+jobs:
+  delete-ruleset:
+    name: Find and delete phantom org ruleset
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate Provisioner App installation token (org scope)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id:      ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner:       ${{ github.repository_owner }}
+
+      - name: List org rulesets and identify phantom-causing entries
+        id: find-ruleset
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG:      ${{ github.repository_owner }}
+          DRY_RUN:  ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          echo "## Org Rulesets" >> "$GITHUB_STEP_SUMMARY"
+
+          RULESETS=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/$ORG/rulesets?per_page=100")
+
+          COUNT=$(echo "$RULESETS" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+          echo "Total rulesets found: $COUNT" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No rulesets found. The phantom runs may have a different root cause." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "ruleset_id=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Print all rulesets for audit
+          echo "$RULESETS" | python3 - <<'PYEOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          rulesets = json.load(sys.stdin)
+          for r in rulesets:
+              print(f"\n### Ruleset id={r['id']} name={r['name']} enforcement={r['enforcement']}")
+              for rule in r.get('rules', []):
+                  print(f"  rule type={rule['type']}  params={rule.get('parameters', {})}")
+          PYEOF
+
+          # Find rulesets with required_workflow rules referencing bootstrap files
+          TARGET_ID=$(echo "$RULESETS" | python3 - <<'PYEOF'
+          import json, sys
+          rulesets = json.load(sys.stdin)
+          BOOTSTRAP_PATHS = {'bootstrap.yml', 'bootstrap-dispatch.yml',
+                             '.github/workflows/bootstrap.yml',
+                             '.github/workflows/bootstrap-dispatch.yml'}
+          for r in rulesets:
+              for rule in r.get('rules', []):
+                  if rule.get('type') == 'required_workflows':
+                      for wf in rule.get('parameters', {}).get('required_workflows', []):
+                          path = wf.get('path', '')
+                          if any(b in path for b in BOOTSTRAP_PATHS):
+                              print(r['id'])
+                              sys.exit(0)
+              # Also check if name references bootstrap
+              if 'bootstrap' in r.get('name', '').lower():
+                  print(r['id'])
+                  sys.exit(0)
+          print('')
+          PYEOF
+          )
+
+          if [ -z "$TARGET_ID" ]; then
+            echo "⚠️  No ruleset referencing bootstrap workflows found." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "All rulesets listed above — inspect manually if phantom runs persist." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "🎯 Target ruleset ID: $TARGET_ID" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "ruleset_id=$TARGET_ID" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN"     >> "$GITHUB_OUTPUT"
+
+      - name: Delete phantom ruleset
+        if: steps.find-ruleset.outputs.ruleset_id != '' && inputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG:      ${{ github.repository_owner }}
+          ID:       ${{ steps.find-ruleset.outputs.ruleset_id }}
+        run: |
+          set -euo pipefail
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X DELETE \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/$ORG/rulesets/$ID")
+
+          if [ "$HTTP_STATUS" -eq 204 ]; then
+            echo "✅ Ruleset $ID deleted successfully." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Phantom push runs on bootstrap-dispatch.yml and bootstrap.yml should stop after the next push." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ DELETE returned HTTP $HTTP_STATUS" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Dry run notice
+        if: inputs.dry_run == 'true'
+        run: |
+          echo "ℹ️  Dry run — no ruleset deleted." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Re-dispatch with dry_run=false to delete." | tee -a "$GITHUB_STEP_SUMMARY"

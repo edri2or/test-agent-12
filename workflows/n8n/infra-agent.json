@@ -1,0 +1,90 @@
+{
+  "name": "infra-agent",
+  "nodes": [
+    {
+      "id": "webhook-infra",
+      "name": "infra-agent Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "infra-agent",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-build-reply",
+      "name": "Build Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst text = (body.text || '').toString();\nconst chatId = String(body.chat_id || '');\nconst isTest = chatId === 'test' || chatId.startsWith('test-');\nconst reply = '\\ud83d\\udd27 infra-agent \\u05d9\\u05d4\\u05d9\\u05d4 \\u05d6\\u05de\\u05d9\\u05df \\u05d1-Iter 6.\\n\\u05d4\\u05d1\\u05e7\\u05e9\\u05d4: ' + (text.slice(0, 120));\nreturn [{ json: { chat_id: chatId, reply_text: reply, is_test: isTest } }];"
+      }
+    },
+    {
+      "id": "if-test",
+      "name": "Is Test?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [750, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{ $json.is_test }}", "value2": true }
+          ]
+        }
+      }
+    },
+    {
+      "id": "telegram-send",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1000, 400],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply_text }}"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "@@CRED_TELEGRAM_ID@@",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, agent: 'infra', reply: $json.reply_text }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "infra-agent Webhook": {
+      "main": [[{ "node": "Build Reply", "type": "main", "index": 0 }]]
+    },
+    "Build Reply": {
+      "main": [[{ "node": "Is Test?", "type": "main", "index": 0 }]]
+    },
+    "Is Test?": {
+      "main": [
+        [{ "node": "Respond", "type": "main", "index": 0 }],
+        [{ "node": "Send Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Reply": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

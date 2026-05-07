@@ -1,0 +1,25 @@
+name: Bootstrap
+
+# STUB — this file exists only to absorb phantom push-event runs created by
+# GitHub's org Required Workflow mechanism. The file is kept disabled via the
+# GitHub Actions API so it never runs on real dispatch events.
+#
+# All bootstrap logic lives in bootstrap-dispatch.yml (workflow_dispatch +
+# repository_dispatch triggers). Callers must reference bootstrap-dispatch.yml.
+#
+# NOTE: repository_dispatch is intentionally NOT listed here. GitHub only
+# dispatches repository_dispatch events to ONE matching workflow; if this stub
+# also listened to types: [bootstrap], it would steal the event from
+# bootstrap-dispatch.yml (the real implementation).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stub:
+    name: Bootstrap stub (disabled — see bootstrap-dispatch.yml)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "This workflow is disabled. Real bootstrap logic is in bootstrap-dispatch.yml."
+          exit 1

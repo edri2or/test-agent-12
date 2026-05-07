@@ -1,0 +1,983 @@
+name: Apply Railway spec (ADR-0013)
+
+# Per ADR-0013 + ADR-0009: spec-driven Railway provisioner. Reads
+# `spec.railway.services[]` from a SystemSpec YAML and converges the
+# operator's Railway account on a project named after `metadata.name`
+# containing one service per spec entry.
+#
+# Per-service behaviour:
+#   kind: typescript → serviceCreate then serviceConnect with
+#                       { repo: spec.github.repo, branch: main,
+#                         rootDirectory: spec.rootDir? }
+#   kind: docker     → serviceCreate with source.image = spec.image
+#                       (no repo connect)
+#
+# Idempotent. Reuses the state-A/B/C classifier pattern from
+# apply-railway-provision.yml: aggregates projects from BOTH
+# `me.projects` (personal) AND `me.workspaces[*].projects` to
+# avoid duplicate-project bugs (runs 25215551564, 25215937519).
+#
+# When n8n (kind: docker) is in the spec, Postgres is auto-provisioned
+# (service + Volume + env vars) to match apply-railway-provision.yml.
+# bootstrap-dispatch.yml Phase 3 injects DB_TYPE=postgresdb on n8n;
+# without Postgres, Railway resolves the Postgres.DATABASE_URL reference
+# to empty and n8n crashes.  Auto-inject keeps the two workflows consistent.
+#
+# Writes IDs to GCP Secret Manager in the **target clone's** GCP
+# project (`spec.gcp.projectId`, ADR-0010 secret namespace boundary):
+#   railway-project-id
+#   railway-environment-id
+#   railway-<service-name>-service-id   (one per spec service)
+#   railway-postgres-service-id         (when auto-provisioned)
+#
+# Also sets APP_NAME + WEBHOOK_URL as GitHub Actions repo variables in
+# the clone so that bootstrap.yml Phase 4 (GitHub App registration)
+# runs without skipping on the very first dispatch.
+#
+# All Railway calls send a non-bot UA + Accept header (Cloudflare 1010
+# guard, see ADR-0009).
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec_path:
+        description: 'Spec file path relative to repo root (e.g. specs/hello-world-agent.yaml)'
+        required: true
+        default: 'specs/hello-world-agent.yaml'
+  pull_request:
+    paths:
+      - '.github/workflows/apply-railway-spec.yml'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    name: Provision Railway from spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Validation is gated on workflow_dispatch: the PR self-register run
+      # only emits a notice, and the parent apply-system-spec.yml has
+      # already validated the spec before dispatching here. Saves ~40s/PR.
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci --silent
+        if: github.event_name == 'workflow_dispatch'
+
+      - name: Validate spec against system-spec.v1.json
+        if: github.event_name == 'workflow_dispatch'
+        run: npm run test:docs
+
+      - name: Parse spec fields
+        id: parse
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SPEC_PATH: ${{ inputs.spec_path }}
+        run: |
+          node <<'JSEOF'
+          const { readFileSync, appendFileSync } = require("node:fs");
+          const yaml = require("js-yaml");
+          const path = process.env.SPEC_PATH;
+          const doc = yaml.load(readFileSync(path, "utf8"));
+          const { spec, metadata } = doc;
+          const services = (spec.railway || {}).services || [];
+          const out = process.env.GITHUB_OUTPUT;
+          appendFileSync(out, "spec_name=" + metadata.name + "\n");
+          appendFileSync(out, "gcp_project_id=" + spec.gcp.projectId + "\n");
+          appendFileSync(out, "github_repo=" + spec.github.repo + "\n");
+          appendFileSync(out, "has_railway=" + (services.length > 0 ? "true" : "false") + "\n");
+          appendFileSync(out, "services_json<<EOF_SVCS\n" + JSON.stringify(services) + "\nEOF_SVCS\n");
+          JSEOF
+
+      - name: Authenticate to GCP (WIF)
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_railway == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_railway == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Probe + mutate via Railway GraphQL
+        id: railway
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_railway == 'true'
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          PROJECT_NAME:      ${{ steps.parse.outputs.spec_name }}
+          REPO_FULL_NAME:    ${{ steps.parse.outputs.github_repo }}
+          REPO_BRANCH:       main
+          SERVICES_JSON:     ${{ steps.parse.outputs.services_json }}
+          GH_EVENT:          ${{ github.event_name }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, sys, time, urllib.request, urllib.error
+
+          GRAPHQL = "https://backboard.railway.app/graphql/v2"
+          HEADERS_BASE = {
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
+            "User-Agent":   "autonomous-agent-template-builder/1.0 (+apply-railway-spec.yml)",
+          }
+
+          token          = os.environ["RAILWAY_API_TOKEN"]
+          project_name   = os.environ["PROJECT_NAME"]
+          repo_full_name = os.environ["REPO_FULL_NAME"]
+          repo_branch    = os.environ["REPO_BRANCH"]
+          services_spec  = json.loads(os.environ["SERVICES_JSON"])
+          summary_path   = os.environ["GITHUB_STEP_SUMMARY"]
+          output_path    = os.environ["GITHUB_OUTPUT"]
+
+          STEP_SUMMARY_ERROR_CHARS = 3000
+          ANNOTATION_CHARS         = 2000
+
+          def w(line=""):
+            with open(summary_path, "a") as f:
+              f.write(line + "\n")
+
+          def out(name, value):
+            with open(output_path, "a") as f:
+              f.write(f"{name}={value}\n")
+
+          def annotate_error(title, body):
+            err = json.dumps(body)[:ANNOTATION_CHARS].replace("\n", " ").replace("%", "%25")
+            print(f"::error title={title}::{err}")
+
+          def gql_raw(query, variables=None):
+            payload = {"query": query}
+            if variables is not None:
+              payload["variables"] = variables
+            req = urllib.request.Request(
+              GRAPHQL,
+              data=json.dumps(payload).encode(),
+              headers={**HEADERS_BASE, "Authorization": f"Bearer {token}"},
+              method="POST",
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+              body = {"_http_error": e.code, "_body": e.read().decode("utf-8", "replace")}
+            except Exception as e:
+              body = {"_transport_error": repr(e)}
+            ok = not ("_http_error" in body or "_transport_error" in body or body.get("errors"))
+            return ok, body
+
+          def gql(query, variables=None, op="anonymous"):
+            ok, body = gql_raw(query, variables)
+            if not ok:
+              w(f"## ❌ GraphQL `{op}` failed")
+              w()
+              w("```json")
+              w(json.dumps(body, indent=2)[:STEP_SUMMARY_ERROR_CHARS])
+              w("```")
+              w()
+              annotate_error(f"Railway {op} failed", body)
+              sys.exit(1)
+            return body["data"]
+
+          # ── Step 1: classify state via `me` (personal + workspace projects)
+          PROJECT_FRAGMENT = """
+            id name
+            services { edges { node { id name } } }
+            environments { edges { node { id name } } }
+          """
+          probe_query = """
+          query Probe {
+            me {
+              id email name
+              workspaces {
+                id name
+                projects { edges { node { %s } } }
+              }
+              projects { edges { node { %s } } }
+            }
+          }
+          """ % (PROJECT_FRAGMENT, PROJECT_FRAGMENT)
+          data = gql(probe_query, op="me")
+          me = data.get("me") or {}
+          workspaces = me.get("workspaces") or []
+
+          all_projects_by_id = {}
+          for edge in (me.get("projects", {}).get("edges") or []):
+            p = edge["node"]
+            all_projects_by_id.setdefault(p["id"], p)
+          for ws in workspaces:
+            for edge in (ws.get("projects", {}).get("edges") or []):
+              p = edge["node"]
+              all_projects_by_id.setdefault(p["id"], p)
+          projects = list(all_projects_by_id.values())
+
+          spec_svc_names = {s["name"] for s in services_spec}
+          state = "C"
+          chosen = None
+          named = [p for p in projects if p["name"] == project_name]
+          for p in named:
+            svcs = {s["node"]["name"] for s in (p.get("services", {}).get("edges") or [])}
+            if spec_svc_names.issubset(svcs):
+              state = "A"; chosen = p; break
+          if state == "C" and named:
+            chosen = max(named, key=lambda p: len(p.get("services", {}).get("edges") or []))
+            state = "B"
+
+          w("# Railway provision (spec-driven) — ADR-0013")
+          w()
+          w(f"- Spec project name: `{project_name}`")
+          w(f"- Spec services: {sorted(spec_svc_names)}")
+          w(f"- Authenticated as: `{me.get('email','?')}`")
+          w(f"- Total projects (deduped): **{len(projects)}**")
+          w(f"- Projects named `{project_name}`: **{len(named)}**")
+          w(f"- **Initial state: {state}**")
+          w()
+
+          # ── Step 2: state-C → projectCreate ──────────────────────────────
+          if state == "C":
+            if not workspaces:
+              w("## ❌ No workspace exposed by `me`")
+              annotate_error("Railway no workspace", {"workspaces": workspaces})
+              sys.exit(1)
+            workspace_id = workspaces[0]["id"]
+            w(f"- Using workspace: `{workspaces[0]['name']}` (id `{workspace_id}`)")
+            create_proj = """
+            mutation ProjectCreate($input: ProjectCreateInput!) {
+              projectCreate(input: $input) {
+                id name
+                environments { edges { node { id name } } }
+                services     { edges { node { id name } } }
+              }
+            }
+            """
+            data = gql(
+              create_proj,
+              {"input": {"name": project_name, "workspaceId": workspace_id}},
+              op="projectCreate",
+            )
+            chosen = data["projectCreate"]
+            w(f"- ✅ Created project `{chosen['name']}` (id `{chosen['id']}`)")
+            print(f"::notice::Railway projectCreate id={chosen['id']}")
+
+          project_id = chosen["id"]
+          envs = [e["node"] for e in (chosen.get("environments", {}).get("edges") or [])]
+          if not envs:
+            w("## ❌ Project has no environments")
+            annotate_error("Railway project missing environments", chosen)
+            sys.exit(1)
+          environment = next((e for e in envs if e["name"] == "production"), envs[0])
+          environment_id = environment["id"]
+          w(f"- Environment: `{environment['name']}` (id `{environment_id}`)")
+
+          existing_svcs = {
+            s["node"]["name"]: s["node"]["id"]
+            for s in (chosen.get("services", {}).get("edges") or [])
+          }
+
+          # ── Step 3: serviceCreate per spec entry, kind-aware ─────────────
+          create_svc = """
+          mutation ServiceCreate($input: ServiceCreateInput!) {
+            serviceCreate(input: $input) { id name }
+          }
+          """
+          connect_svc = """
+          mutation ServiceConnect($id: String!, $input: ServiceConnectInput!) {
+            serviceConnect(id: $id, input: $input) { id }
+          }
+          """
+          KNOWN_KINDS = {"typescript", "docker"}
+          service_ids = {}
+          for svc in services_spec:
+            svc_name = svc["name"]
+            svc_kind = svc["kind"]
+            if svc_kind not in KNOWN_KINDS:
+              w(f"## ❌ Unknown service kind `{svc_kind}` for `{svc_name}`")
+              annotate_error("Unknown service kind", svc)
+              sys.exit(1)
+            if svc_name in existing_svcs:
+              svc_id = existing_svcs[svc_name]
+              w(f"- Adopted existing service `{svc_name}` (id `{svc_id}`)")
+              service_ids[svc_name] = svc_id
+              continue
+            if svc_kind == "docker":
+              create_input = {
+                "projectId": project_id,
+                "name":      svc_name,
+                "source":    {"image": svc["image"]},
+              }
+            else:
+              create_input = {"projectId": project_id, "name": svc_name}
+            data = gql(create_svc, {"input": create_input}, op=f"serviceCreate({svc_name})")
+            svc_id = data["serviceCreate"]["id"]
+            w(f"- ✅ Created service `{svc_name}` kind=`{svc_kind}` (id `{svc_id}`)")
+            if svc_kind == "typescript":
+              connect_input = {"repo": repo_full_name, "branch": repo_branch}
+              if svc.get("rootDir"):
+                # Railway's serviceConnect requires rootDirectory to begin
+                # with "/". Specs use the schema-natural form ("src/agent")
+                # so we normalise here. Without the leading slash, Railway
+                # GraphQL returns HTTP 400 "Problem processing request"
+                # (observed in run 25254593970 → traceId 1063208912086486711).
+                rd = svc["rootDir"]
+                connect_input["rootDirectory"] = rd if rd.startswith("/") else "/" + rd
+              gql(
+                connect_svc,
+                {"id": svc_id, "input": connect_input},
+                op=f"serviceConnect({svc_name})",
+              )
+              w(f"  - Connected to `{repo_full_name}@{repo_branch}`"
+                + (f" rootDir=`{svc['rootDir']}`" if svc.get("rootDir") else ""))
+            print(f"::notice::Railway serviceCreate {svc_name} kind={svc_kind} id={svc_id}")
+            service_ids[svc_name] = svc_id
+
+          # ── Step 3.5: project-scoped token (query-then-create) ───────────
+          # Mints a Railway token scoped to THIS project so the clone's
+          # downstream deploy.yml + bootstrap.yml can stop relying on the
+          # operator's account-level RAILWAY_API_TOKEN (which is over-
+          # privileged — gives access to ALL projects in the operator's
+          # Railway account; flagged as R-10 risk).
+          # Idempotent: the same query-then-create idiom as service_ids above.
+          PROJECT_TOKEN_NAME = "aatb-provisioner"
+          probe_tokens_q = """
+          query ProjectTokens($projectId: String!) {
+            projectTokens(projectId: $projectId) {
+              edges { node { id name } }
+            }
+          }
+          """
+          ok, body = gql_raw(probe_tokens_q, {"projectId": project_id})
+          existing_token_id = None
+          if ok:
+            for edge in (body["data"].get("projectTokens", {}).get("edges") or []):
+              n = edge["node"]
+              if n.get("name") == PROJECT_TOKEN_NAME:
+                existing_token_id = n["id"]
+                break
+          else:
+            w(f"- ⚠ projectTokens probe failed ({body}); attempting create")
+
+          new_token_value = ""
+          new_token_id = ""
+          if existing_token_id is not None:
+            new_token_id = existing_token_id
+            # Cannot recover token VALUE from Railway (shown only at create);
+            # the clone's GSM already has it from the prior dispatch. Skip
+            # the GSM write via the upsert_secret empty-value guard below.
+            w(f"- Adopted existing project token `{PROJECT_TOKEN_NAME}` (id `{existing_token_id}`); GSM write skipped")
+            print(f"::notice::Railway projectToken reused id={existing_token_id}")
+          else:
+            create_token_m = """
+            mutation ProjectTokenCreate($input: ProjectTokenCreateInput!) {
+              projectTokenCreate(input: $input)
+            }
+            """
+            # Many Railway plans require an environment for project tokens.
+            # We pass the production environment we resolved above.
+            create_input = {
+              "projectId":     project_id,
+              "environmentId": environment_id,
+              "name":          PROJECT_TOKEN_NAME,
+            }
+            ok, body = gql_raw(create_token_m, {"input": create_input})
+            if not ok:
+              # Non-fatal: project + services already provisioned successfully,
+              # and downstream consumers (deploy.yml, bootstrap.yml) still use
+              # the account-level RAILWAY_API_TOKEN. Failing the workflow over
+              # an optional scoped-token enhancement would block real work.
+              w(f"## ⚠ projectTokenCreate failed (non-fatal): {json.dumps(body)[:600]}")
+              print(f"::warning title=Railway projectTokenCreate FAILED::{json.dumps(body)[:400]}")
+            else:
+              # Schema variants: result may be a bare string (token value) or an
+              # object {id, token}. Handle both.
+              raw = body["data"].get("projectTokenCreate")
+              if isinstance(raw, str):
+                new_token_value = raw
+              elif isinstance(raw, dict):
+                new_token_value = raw.get("token", "")
+                new_token_id    = raw.get("id", "")
+              if new_token_value:
+                w(f"- ✅ Created project token `{PROJECT_TOKEN_NAME}`"
+                  + (f" (id `{new_token_id}`)" if new_token_id else ""))
+                print("::notice::Railway projectTokenCreate succeeded")
+              else:
+                w(f"- ⚠ projectTokenCreate returned unexpected shape: {raw!r}")
+                print("::warning::Railway projectTokenCreate empty value")
+
+          # ── Step 3.6: auto-provision Postgres when n8n is in the spec ────
+          # bootstrap-dispatch.yml Phase 3 injects DB_TYPE=postgresdb on the
+          # n8n service whenever railway_n8n_service_id is present.  Without
+          # a Postgres service, Railway resolves the Postgres.DATABASE_URL reference
+          # to an empty string → n8n crashes on startup.  Auto-provisioning here
+          # mirrors apply-railway-provision.yml and makes the pair consistent.
+          POSTGRES_SERVICE_NAME = "Postgres"
+          POSTGRES_IMAGE = "ghcr.io/railwayapp-templates/postgres-ssl:17"
+          postgres_service_id = ""
+
+          if any(s["name"] == "n8n" for s in services_spec):
+            if POSTGRES_SERVICE_NAME in existing_svcs:
+              postgres_service_id = existing_svcs[POSTGRES_SERVICE_NAME]
+              w(f"- Adopted existing `{POSTGRES_SERVICE_NAME}` service (id `{postgres_service_id}`)")
+              print(f"::notice::Railway Postgres adopted id={postgres_service_id}")
+            else:
+              data = gql(create_svc,
+                {"input": {"projectId": project_id, "name": POSTGRES_SERVICE_NAME,
+                           "source": {"image": POSTGRES_IMAGE}}},
+                op=f"serviceCreate({POSTGRES_SERVICE_NAME})")
+              postgres_service_id = data["serviceCreate"]["id"]
+              w(f"- ✅ Auto-provisioned `{POSTGRES_SERVICE_NAME}` for n8n (id `{postgres_service_id}`)")
+              print(f"::notice::Railway auto-provisioned Postgres id={postgres_service_id}")
+            # Lowercase key → write loop produces railway-postgres-service-id in SM
+            service_ids["postgres"] = postgres_service_id
+
+          # ── Step 4: emit IDs to step outputs ─────────────────────────────
+          out("project_id",          project_id)
+          out("environment_id",      environment_id)
+          out("service_ids_json",    json.dumps(service_ids))
+          out("project_token_value", new_token_value)
+          out("project_token_id",    new_token_id)
+          out("postgres_service_id", postgres_service_id)
+
+          w()
+          w("## Captured IDs")
+          w()
+          w("```json")
+          w(json.dumps({
+            "project_id":     project_id,
+            "environment_id": environment_id,
+            "services":       service_ids,
+          }, indent=2))
+          w("```")
+          print(f"::notice::Railway spec mutations complete state={state} project={project_id}")
+          PYEOF
+
+      - name: Write IDs to target clone's GCP Secret Manager
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_railway == 'true'
+        env:
+          TARGET_GCP_PROJECT_ID: ${{ steps.parse.outputs.gcp_project_id }}
+          SOURCE_GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          PROJECT_ID:            ${{ steps.railway.outputs.project_id }}
+          ENVIRONMENT_ID:        ${{ steps.railway.outputs.environment_id }}
+          SERVICE_IDS_JSON:      ${{ steps.railway.outputs.service_ids_json }}
+          PROJECT_TOKEN_VALUE:   ${{ steps.railway.outputs.project_token_value }}
+          PROJECT_TOKEN_ID:      ${{ steps.railway.outputs.project_token_id }}
+        run: |
+          set -euo pipefail
+          upsert_secret() {
+            local name="$1" value="$2"
+            if [[ -z "$value" ]]; then
+              echo "::warning::Empty value for $name — skipping"
+              return
+            fi
+            gcloud secrets create "$name" --project="$TARGET_GCP_PROJECT_ID" --replication-policy=automatic 2>/dev/null || true
+            printf '%s' "$value" | gcloud secrets versions add "$name" --project="$TARGET_GCP_PROJECT_ID" --data-file=- >/dev/null
+            echo "✅ $name written to project $TARGET_GCP_PROJECT_ID"
+          }
+          upsert_secret railway-project-id     "$PROJECT_ID"
+          upsert_secret railway-environment-id "$ENVIRONMENT_ID"
+          # railway-project-token / -id are only present on the FIRST dispatch
+          # (Railway shows the secret value only at create time; on reuse the
+          # GSM secret already exists from the earlier run, so empty-value
+          # upsert is a no-op via the upsert_secret guard above).
+          upsert_secret railway-project-token    "$PROJECT_TOKEN_VALUE"
+          upsert_secret railway-project-token-id "$PROJECT_TOKEN_ID"
+          # projectTokenCreate tokens are deployment-only; variableCollectionUpsert requires account-level token.
+          RAILWAY_ACCOUNT_TOKEN="$(gcloud secrets versions access latest \
+            --secret=railway-api-token --project="$SOURCE_GCP_PROJECT_ID" 2>/dev/null || echo "")"
+          upsert_secret railway-api-token "$RAILWAY_ACCOUNT_TOKEN"
+
+          {
+            echo
+            echo "## GCP Secret Manager — Railway IDs (target project \`$TARGET_GCP_PROJECT_ID\`)"
+            echo
+            echo "| Secret | Length |"
+            echo "|--------|--------|"
+            echo "| \`railway-project-id\`     | ${#PROJECT_ID} |"
+            echo "| \`railway-environment-id\` | ${#ENVIRONMENT_ID} |"
+            if [[ -n "$PROJECT_TOKEN_VALUE" ]]; then
+              echo "| \`railway-project-token\`    | ${#PROJECT_TOKEN_VALUE} (newly minted) |"
+            fi
+            if [[ -n "$PROJECT_TOKEN_ID" ]]; then
+              echo "| \`railway-project-token-id\` | ${#PROJECT_TOKEN_ID} |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Per-service secret name: railway-<service-name>-service-id
+          echo "$SERVICE_IDS_JSON" | python3 -c '
+          import json, sys, os
+          ids = json.load(sys.stdin)
+          for name, sid in ids.items():
+              print(f"{name}\t{sid}")
+          ' | while IFS=$'\t' read -r svc_name svc_id; do
+            secret_name="railway-${svc_name}-service-id"
+            upsert_secret "$secret_name" "$svc_id"
+            echo "| \`$secret_name\` | ${#svc_id} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Attach Volume to Postgres (idempotent)
+        if: github.event_name == 'workflow_dispatch' && steps.railway.outputs.postgres_service_id != ''
+        env:
+          RAILWAY_API_TOKEN:   ${{ secrets.RAILWAY_API_TOKEN }}
+          PROJECT_ID:          ${{ steps.railway.outputs.project_id }}
+          ENVIRONMENT_ID:      ${{ steps.railway.outputs.environment_id }}
+          POSTGRES_SERVICE_ID: ${{ steps.railway.outputs.postgres_service_id }}
+        run: |
+          set -euo pipefail
+          GQL="https://backboard.railway.app/graphql/v2"
+          AUTH="Authorization: Bearer ${RAILWAY_API_TOKEN}"
+          CT="Content-Type: application/json"
+          UA="User-Agent: autonomous-agent-template-builder/1.0 (+apply-railway-spec.yml)"
+
+          VOL_COUNT=$(curl -s -X POST "$GQL" \
+            -H "$AUTH" -H "$CT" -H "$UA" \
+            -d "$(jq -cn --arg pid "$PROJECT_ID" \
+              '{"query":"query($pid:String!){project(id:$pid){volumes{edges{node{id}}}}}","variables":{"pid":$pid}}')" \
+            | jq '.data.project.volumes.edges | length')
+
+          if [ "${VOL_COUNT:-0}" -gt 0 ]; then
+            echo "Volume already attached (count: $VOL_COUNT) — skipping."
+            echo "| Postgres volume | ✅ existing |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            RESP=$(curl -s -X POST "$GQL" \
+              -H "$AUTH" -H "$CT" -H "$UA" \
+              -d "$(jq -cn \
+                --arg pid "$PROJECT_ID" \
+                --arg sid "$POSTGRES_SERVICE_ID" \
+                --arg eid "$ENVIRONMENT_ID" \
+                '{"query":"mutation($i:VolumeCreateInput!){volumeCreate(input:$i){id name}}","variables":{"i":{"projectId":$pid,"serviceId":$sid,"environmentId":$eid,"mountPath":"/var/lib/postgresql/data"}}}')")
+            VOL_ID=$(echo "$RESP" | jq -r '.data.volumeCreate.id // empty')
+            if [ -z "$VOL_ID" ]; then
+              echo "::error::Volume creation failed: $(echo "$RESP" | jq -c '{errors:.errors}')"
+              exit 1
+            fi
+            echo "| Postgres volume | ✅ created ($VOL_ID) |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Configure Postgres env vars (idempotent)
+        if: github.event_name == 'workflow_dispatch' && steps.railway.outputs.postgres_service_id != ''
+        env:
+          RAILWAY_API_TOKEN:   ${{ secrets.RAILWAY_API_TOKEN }}
+          PROJECT_ID:          ${{ steps.railway.outputs.project_id }}
+          ENVIRONMENT_ID:      ${{ steps.railway.outputs.environment_id }}
+          POSTGRES_SERVICE_ID: ${{ steps.railway.outputs.postgres_service_id }}
+        run: |
+          set -euo pipefail
+          GQL="https://backboard.railway.app/graphql/v2"
+          AUTH="Authorization: Bearer ${RAILWAY_API_TOKEN}"
+          CT="Content-Type: application/json"
+          UA="User-Agent: autonomous-agent-template-builder/1.0 (+apply-railway-spec.yml)"
+
+          PGDATA_EXISTING=$(curl -s -X POST "$GQL" \
+            -H "$AUTH" -H "$CT" -H "$UA" \
+            -d "$(jq -cn \
+              --arg sid "$POSTGRES_SERVICE_ID" \
+              --arg eid "$ENVIRONMENT_ID" \
+              --arg pid "$PROJECT_ID" \
+              '{"query":"query($sid:String!,$eid:String!,$pid:String!){variables(serviceId:$sid,environmentId:$eid,projectId:$pid)}","variables":{"sid":$sid,"eid":$eid,"pid":$pid}}')" \
+            | jq -r '.data.variables.PGDATA // empty')
+
+          if [ -n "$PGDATA_EXISTING" ]; then
+            echo "Postgres env vars already configured (PGDATA=$PGDATA_EXISTING) — skipping."
+            echo "| Postgres env vars | ✅ existing |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            PGPASS=$(openssl rand -hex 16)
+            DOLLAR='$'
+            RESP=$(curl -s -X POST "$GQL" \
+              -H "$AUTH" -H "$CT" -H "$UA" \
+              -d "$(jq -cn \
+                --arg pid "$PROJECT_ID" \
+                --arg eid "$ENVIRONMENT_ID" \
+                --arg sid "$POSTGRES_SERVICE_ID" \
+                --arg pass "$PGPASS" \
+                --arg durl "postgresql://postgres:${DOLLAR}{{POSTGRES_PASSWORD}}@${DOLLAR}{{RAILWAY_PRIVATE_DOMAIN}}:5432/railway" \
+                '{"query":"mutation($i:VariableCollectionUpsertInput!){variableCollectionUpsert(input:$i)}","variables":{"i":{"projectId":$pid,"environmentId":$eid,"serviceId":$sid,"variables":{"POSTGRES_DB":"railway","POSTGRES_USER":"postgres","POSTGRES_PASSWORD":$pass,"PGDATA":"/var/lib/postgresql/data/pgdata","DATABASE_URL":$durl}}}}')")
+            if echo "$RESP" | jq -e '.errors' > /dev/null 2>&1; then
+              echo "::error::Postgres env vars upsert failed: $(echo "$RESP" | jq -c '.errors')"
+              exit 1
+            fi
+            echo "| Postgres env vars | ✅ configured |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Redeploy n8n (apply current env vars from Secret Manager)
+        # serviceInstanceRedeploy forces n8n to restart with whatever env vars are
+        # currently set in Railway.  Without this, a service stuck in CRASHED state
+        # (e.g. from a pre-Postgres bootstrap run) never picks up the correct
+        # DATABASE_URL that bootstrap-dispatch.yml Phase 3 just wrote via
+        # variableCollectionUpsert.  Railway does NOT always auto-redeploy after
+        # variableCollectionUpsert when the service is already in a terminal state.
+        if: github.event_name == 'workflow_dispatch' && steps.railway.outputs.service_ids_json != ''
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          SERVICE_IDS_JSON:  ${{ steps.railway.outputs.service_ids_json }}
+          ENVIRONMENT_ID:    ${{ steps.railway.outputs.environment_id }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, sys, time, urllib.request
+
+          token        = os.environ["RAILWAY_API_TOKEN"]
+          service_ids  = json.loads(os.environ["SERVICE_IDS_JSON"])
+          env_id       = os.environ["ENVIRONMENT_ID"]
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+
+          GRAPHQL = "https://backboard.railway.app/graphql/v2"
+          HEADERS = {
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent":    "autonomous-agent-template-builder/1.0 (+apply-railway-spec.yml)",
+          }
+
+          def w(line=""):
+            with open(summary_path, "a") as f:
+              f.write(line + "\n")
+
+          def gql(query, variables):
+            req = urllib.request.Request(
+              GRAPHQL,
+              data=json.dumps({"query": query, "variables": variables}).encode(),
+              headers=HEADERS, method="POST",
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+              return not body.get("errors"), body
+            except Exception as e:
+              return False, {"_error": repr(e)}
+
+          redeploy_m = """
+          mutation Redeploy($sid: String!, $eid: String!) {
+            serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+          }
+          """
+
+          n8n_svc_id = service_ids.get("n8n")
+          if not n8n_svc_id:
+            w("⚠ No n8n in service_ids — skipping redeploy step")
+            print("::warning::No n8n service ID — skipping redeploy step")
+            sys.exit(0)
+
+          w("## n8n serviceInstanceRedeploy")
+          w()
+          ok, body = gql(redeploy_m, {"sid": n8n_svc_id, "eid": env_id})
+          if ok:
+            w(f"- ✅ serviceInstanceRedeploy triggered for n8n (id `{n8n_svc_id}`)")
+            print(f"::notice::Railway n8n serviceInstanceRedeploy triggered — health gate awaits new deployment")
+            # Brief pause so Railway registers the new deployment before the first health gate poll.
+            time.sleep(20)
+          else:
+            err = json.dumps(body)[:400]
+            w(f"- ⚠ serviceInstanceRedeploy failed (non-fatal): {err}")
+            print(f"::warning::Railway n8n serviceInstanceRedeploy failed (non-fatal): {err}")
+          PYEOF
+
+      - name: Verify deployment health (poll deploymentStatus)
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_railway == 'true'
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          PROJECT_ID:        ${{ steps.railway.outputs.project_id }}
+          ENVIRONMENT_ID:    ${{ steps.railway.outputs.environment_id }}
+          SERVICE_IDS_JSON:  ${{ steps.railway.outputs.service_ids_json }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, sys, time, urllib.request, urllib.error
+
+          token        = os.environ["RAILWAY_API_TOKEN"]
+          PROJECT_ID   = os.environ["PROJECT_ID"]
+          ENVIRONMENT_ID = os.environ["ENVIRONMENT_ID"]
+          SERVICE_IDS  = json.loads(os.environ["SERVICE_IDS_JSON"])
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+
+          TERMINAL      = {"SUCCESS", "CRASHED", "FAILED", "REMOVED"}
+          POLL_INTERVAL = 30
+          MAX_ATTEMPTS  = 20  # 10 minutes max
+
+          def w(line=""):
+            with open(summary_path, "a") as f:
+              f.write(line + "\n")
+
+          def gql(query, variables):
+            req = urllib.request.Request(
+              "https://backboard.railway.app/graphql/v2",
+              data=json.dumps({"query": query, "variables": variables}).encode(),
+              headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json",
+                "Accept":        "application/json",
+                "User-Agent":    "autonomous-agent-template-builder/1.0 (+apply-railway-spec.yml)",
+              },
+              method="POST",
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read())
+              return True, body
+            except Exception as e:
+              return False, {"_error": repr(e)}
+
+          deploy_q = """
+          query Deployments($pid: String!, $eid: String!) {
+            deployments(input: { projectId: $pid, environmentId: $eid }) {
+              edges { node { id status serviceId createdAt } }
+            }
+          }
+          """
+
+          svc_id_to_name = {v: k for k, v in SERVICE_IDS.items()}
+          final_statuses = {}
+
+          w("## Deployment health gate")
+          w()
+
+          for attempt in range(MAX_ATTEMPTS):
+            ok, body = gql(deploy_q, {"pid": PROJECT_ID, "eid": ENVIRONMENT_ID})
+            if not ok:
+              w(f"⚠ deploymentStatus query failed (attempt {attempt+1}) — soft-fail, skipping health gate")
+              print(f"::warning::deploymentStatus query failed (attempt {attempt+1}) — skipping health gate")
+              sys.exit(0)
+
+            deploys = body.get("data", {}).get("deployments", {}).get("edges", [])
+            latest = {}
+            for e in deploys:
+              n = e["node"]
+              sid = n["serviceId"]
+              if sid not in latest:
+                latest[sid] = n["status"]
+
+            relevant = {sid: st for sid, st in latest.items() if sid in svc_id_to_name}
+            all_terminal = all(st in TERMINAL for st in relevant.values()) if relevant else False
+
+            if all_terminal or attempt == MAX_ATTEMPTS - 1:
+              final_statuses = relevant
+              break
+
+            w(f"Attempt {attempt+1}/{MAX_ATTEMPTS}: {' '.join(f'{svc_id_to_name.get(s,s[:8])}={st}' for s,st in relevant.items())} — waiting {POLL_INTERVAL}s")
+            time.sleep(POLL_INTERVAL)
+
+          crashed = []
+          for sid, st in final_statuses.items():
+            svc = svc_id_to_name.get(sid, sid[:8])
+            if st == "SUCCESS":
+              w(f"- ✅ `{svc}`: {st}")
+              print(f"::notice::Railway {svc} deploymentStatus={st}")
+            elif st in ("CRASHED", "FAILED"):
+              w(f"- ❌ `{svc}`: **{st}** — check Railway dashboard logs")
+              print(f"::error title={svc} deployment {st}::Service `{svc}` is {st}. Provisioning completed but service crashed. Check Railway logs.")
+              crashed.append(svc)
+            else:
+              w(f"- ⏳ `{svc}`: {st} (timeout after {MAX_ATTEMPTS * POLL_INTERVAL}s — still building)")
+              print(f"::warning::Railway {svc} deploymentStatus={st} (timeout after {MAX_ATTEMPTS * POLL_INTERVAL}s)")
+
+          if not final_statuses:
+            w("No deployments found for provisioned services yet.")
+
+          if crashed:
+            w()
+            w(f"**Hard-fail: {', '.join(crashed)} crashed after provisioning.**")
+            sys.exit(1)
+          PYEOF
+
+      - name: Create/get n8n Railway service domain
+        id: n8n_domain
+        if: github.event_name == 'workflow_dispatch' && steps.parse.outputs.has_railway == 'true'
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          PROJECT_ID:        ${{ steps.railway.outputs.project_id }}
+          ENVIRONMENT_ID:    ${{ steps.railway.outputs.environment_id }}
+          SERVICE_IDS_JSON:  ${{ steps.railway.outputs.service_ids_json }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          GRAPHQL = "https://backboard.railway.app/graphql/v2"
+          HEADERS_BASE = {
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
+            "User-Agent":   "autonomous-agent-template-builder/1.0 (+apply-railway-spec.yml)",
+          }
+
+          token          = os.environ["RAILWAY_API_TOKEN"]
+          project_id     = os.environ["PROJECT_ID"]
+          environment_id = os.environ["ENVIRONMENT_ID"]
+          service_ids    = json.loads(os.environ["SERVICE_IDS_JSON"])
+          output_path    = os.environ["GITHUB_OUTPUT"]
+          summary_path   = os.environ["GITHUB_STEP_SUMMARY"]
+
+          ANNOTATION_CHARS = 400
+
+          def w(line=""):
+            with open(summary_path, "a") as f:
+              f.write(line + "\n")
+
+          def out(name, value):
+            with open(output_path, "a") as f:
+              f.write(f"{name}={value}\n")
+
+          def gql_raw(query, variables=None):
+            payload = {"query": query}
+            if variables is not None:
+              payload["variables"] = variables
+            req = urllib.request.Request(
+              GRAPHQL,
+              data=json.dumps(payload).encode(),
+              headers={**HEADERS_BASE, "Authorization": f"Bearer {token}"},
+              method="POST",
+            )
+            try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+              body = {"_http_error": e.code, "_body": e.read().decode("utf-8", "replace")}
+            except Exception as e:
+              body = {"_transport_error": repr(e)}
+            ok = not ("_http_error" in body or "_transport_error" in body or body.get("errors"))
+            return ok, body
+
+          n8n_svc_id = service_ids.get("n8n")
+          if not n8n_svc_id:
+            w("## ⚠ No service named `n8n` found — WEBHOOK_URL not set")
+            print("::warning::No n8n service in service_ids — skipping domain creation")
+            sys.exit(0)
+
+          w("## n8n Railway domain")
+          w()
+
+          domains_q = """
+          query ServiceDomains($projectId: String!, $environmentId: String!, $serviceId: String!) {
+            domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) {
+              serviceDomains {
+                id
+                domain
+              }
+            }
+          }
+          """
+          ok, body = gql_raw(domains_q, {
+            "projectId":     project_id,
+            "environmentId": environment_id,
+            "serviceId":     n8n_svc_id,
+          })
+          domain = ""
+          if ok:
+            existing = (body.get("data", {}).get("domains") or {}).get("serviceDomains") or []
+            if existing:
+              domain = existing[0]["domain"]
+              w(f"- Adopted existing n8n domain: `{domain}`")
+              print(f"::notice::Railway n8n domain (existing): {domain}")
+
+          if not domain:
+            create_m = """
+            mutation ServiceDomainCreate($input: ServiceDomainCreateInput!) {
+              serviceDomainCreate(input: $input) {
+                id
+                domain
+              }
+            }
+            """
+            ok, body = gql_raw(create_m, {"input": {
+              "serviceId":     n8n_svc_id,
+              "environmentId": environment_id,
+            }})
+            if not ok:
+              err = json.dumps(body)[:ANNOTATION_CHARS]
+              w(f"## ❌ serviceDomainCreate failed: {err}")
+              print(f"::error title=Railway serviceDomainCreate failed::{err}")
+              sys.exit(1)
+            domain = body["data"]["serviceDomainCreate"]["domain"]
+            w(f"- ✅ Created n8n domain: `{domain}`")
+            print(f"::notice::Railway serviceDomainCreate n8n domain={domain}")
+
+          webhook_url = f"https://{domain}/webhook/github"
+          out("n8n_domain",  domain)
+          out("webhook_url", webhook_url)
+          w(f"- WEBHOOK_URL: `{webhook_url}`")
+          PYEOF
+
+      - name: Fetch Provisioner App credentials from Secret Manager
+        id: provisioner
+        if: github.event_name == 'workflow_dispatch' && steps.n8n_domain.outputs.webhook_url != ''
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            provisioner-app-id:${{ vars.GCP_PROJECT_ID }}/provisioner-app-id
+            provisioner-app-private-key:${{ vars.GCP_PROJECT_ID }}/provisioner-app-private-key
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: github.event_name == 'workflow_dispatch' && steps.n8n_domain.outputs.webhook_url != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ steps.provisioner.outputs.provisioner-app-id }}
+          private-key: ${{ steps.provisioner.outputs.provisioner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Set APP_NAME + WEBHOOK_URL in clone repo
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN:    ${{ steps.app-token.outputs.token }}
+          GITHUB_REPO: ${{ steps.parse.outputs.github_repo }}
+          APP_NAME:    ${{ steps.parse.outputs.spec_name }}
+          WEBHOOK_URL: ${{ steps.n8n_domain.outputs.webhook_url }}
+        run: |
+          set -euo pipefail
+          set_var() {
+            local name="$1" value="$2"
+            local -a gh_headers=(
+              -H "Authorization: Bearer $GH_TOKEN"
+              -H "Accept: application/vnd.github+json"
+              -H "X-GitHub-Api-Version: 2022-11-28"
+            )
+            local resp_file; resp_file=$(mktemp)
+            STATUS=$(curl -s -o "$resp_file" -w "%{http_code}" "${gh_headers[@]}" \
+              -X PATCH \
+              "https://api.github.com/repos/$GITHUB_REPO/actions/variables/$name" \
+              -d "{\"name\":\"$name\",\"value\":\"$value\"}")
+            if [[ "$STATUS" == "204" ]]; then
+              echo "✅ Updated $name in $GITHUB_REPO"
+              rm -f "$resp_file"; return
+            fi
+            STATUS=$(curl -s -o "$resp_file" -w "%{http_code}" "${gh_headers[@]}" \
+              -X POST \
+              "https://api.github.com/repos/$GITHUB_REPO/actions/variables" \
+              -d "{\"name\":\"$name\",\"value\":\"$value\"}")
+            local post_msg; post_msg=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('message','?'))" < "$resp_file" 2>/dev/null || echo "?"); rm -f "$resp_file"
+            if [[ "$STATUS" == "201" ]]; then
+              echo "✅ Created $name in $GITHUB_REPO"
+            else
+              echo "::error title=GitHub variable set failed::$name → HTTP $STATUS — $post_msg"
+              exit 1
+            fi
+          }
+          # APP_NAME is set unconditionally — bootstrap Phase 4 depends on it.
+          # WEBHOOK_URL is set only when the Railway domain resolved in time (soft).
+          set_var "APP_NAME" "$APP_NAME"
+          if [[ -n "$WEBHOOK_URL" ]]; then
+            set_var "WEBHOOK_URL" "$WEBHOOK_URL"
+          else
+            echo "::warning::WEBHOOK_URL empty (Railway domain not yet resolved) — skipping WEBHOOK_URL variable"
+          fi
+          {
+            echo
+            echo "## GitHub repo variables → \`$GITHUB_REPO\`"
+            echo
+            echo "| Variable | Value |"
+            echo "|----------|-------|"
+            echo "| \`APP_NAME\`    | \`$APP_NAME\` |"
+            echo "| \`WEBHOOK_URL\` | \`${WEBHOOK_URL:-*(not yet available)*}\` |"
+            echo
+            echo "bootstrap.yml Phase 4 (GitHub App registration) will now run on next dispatch."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::Set APP_NAME=$APP_NAME on $GITHUB_REPO (WEBHOOK_URL=${WEBHOOK_URL:-empty})"
+
+      - name: PR self-register notice
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "## apply-railway-spec.yml — PR self-register"
+            echo ""
+            echo "PR-triggered run is probe-only. No mutations, no Secret writes."
+            echo "Dispatch with \`spec_path\` to provision Railway."
+          } >> "$GITHUB_STEP_SUMMARY"

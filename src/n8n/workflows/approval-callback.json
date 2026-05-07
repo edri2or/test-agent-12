@@ -1,0 +1,218 @@
+{
+  "name": "Approval Callback (Telegram callback_query listener for destroy-resource)",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": ["callback_query"],
+        "additionalFields": {}
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram Callback Query Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "approval-callback"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Authorize + parse the callback_data. ADR-0005 + R-09: chat.id whitelist is the only authorization layer.\n// callback_data format: 'dr:<verb>:<type>:<id>' — verbs a|d, types rs (railway-service, MVP).\nconst update = $input.first().json ?? {};\nconst cb = update.callback_query ?? update;\nif (!cb || typeof cb.data !== 'string' || !cb.id) {\n  throw new Error('No callback_query data on the inbound update — fail-closed');\n}\nconst expected_chat = $env['TELEGRAM_CHAT_ID'] ?? '';\nif (!expected_chat) throw new Error('TELEGRAM_CHAT_ID missing — fail-closed (R-09)');\nconst chat_id = cb.message?.chat?.id;\nconst message_id = cb.message?.message_id ?? cb.message?.id;\nif (String(chat_id) !== String(expected_chat)) {\n  return [{ json: { _action: 'unauthorized', _cb_id: cb.id, _chat_id: chat_id, _message_id: message_id } }];\n}\nconst parts = cb.data.split(':');\nif (parts.length !== 4 || parts[0] !== 'dr' || parts[2] !== 'rs') {\n  return [{ json: { _action: 'unknown', _cb_id: cb.id, _chat_id: chat_id, _message_id: message_id, _raw: cb.data } }];\n}\nconst verb = parts[1];\nconst id = parts[3];\nif (verb === 'a') return [{ json: { _action: 'approve', _cb_id: cb.id, _chat_id: chat_id, _message_id: message_id, _resource_id: id } }];\nif (verb === 'd') return [{ json: { _action: 'deny', _cb_id: cb.id, _chat_id: chat_id, _message_id: message_id, _resource_id: id } }];\nreturn [{ json: { _action: 'unknown', _cb_id: cb.id, _chat_id: chat_id, _message_id: message_id, _raw: cb.data } }];"
+      },
+      "id": "validate-and-parse",
+      "name": "Authorize & Parse",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "options": { "caseSensitive": true, "typeValidation": "strict" }, "conditions": [ { "leftValue": "={{ $json._action }}", "rightValue": "approve", "operator": { "type": "string", "operation": "equals" } } ], "combinator": "and" }, "outputKey": "approve" },
+            { "conditions": { "options": { "caseSensitive": true, "typeValidation": "strict" }, "conditions": [ { "leftValue": "={{ $json._action }}", "rightValue": "deny", "operator": { "type": "string", "operation": "equals" } } ], "combinator": "and" }, "outputKey": "deny" },
+            { "conditions": { "options": { "caseSensitive": true, "typeValidation": "strict" }, "conditions": [ { "leftValue": "={{ $json._action }}", "rightValue": "unauthorized", "operator": { "type": "string", "operation": "equals" } } ], "combinator": "and" }, "outputKey": "unauthorized" }
+          ]
+        },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "unknown" }
+      },
+      "id": "switch-action",
+      "name": "Switch on Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://backboard.railway.app/graphql/v2",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env['RAILWAY_API_TOKEN'] }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ query: 'mutation ServiceDelete($id: String!) { serviceDelete(id: $id) }', variables: { id: $json._resource_id } }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "railway-service-delete",
+      "name": "Railway serviceDelete",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format the approve-arm status message. The Railway HTTP node output is in $input.first().json;\n// the original parsed callback context (chat_id, message_id, cb_id, resource_id) lives on the\n// Authorize & Parse node and must be re-fetched.\nconst r = $input.first().json;\nconst ctx = $('Authorize & Parse').first().json;\nlet text;\nif (r?.errors && Array.isArray(r.errors) && r.errors.length > 0) {\n  text = '❌ Railway serviceDelete failed for ' + ctx._resource_id + ': ' + r.errors.map((e) => e?.message ?? 'unknown').join('; ');\n} else if (r?.data?.serviceDelete === true) {\n  text = '✅ Railway service ' + ctx._resource_id + ' deleted.';\n} else {\n  text = '⚠ Railway serviceDelete returned unexpected response for ' + ctx._resource_id + ': ' + JSON.stringify(r).slice(0, 500);\n}\nreturn [{ json: { _chat_id: ctx._chat_id, _message_id: ctx._message_id, _cb_id: ctx._cb_id, _toast: 'Destroy executed', text } }];"
+      },
+      "id": "format-approve",
+      "name": "Format Approve Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $input.first().json;\nreturn [{ json: { _chat_id: ctx._chat_id, _message_id: ctx._message_id, _cb_id: ctx._cb_id, _toast: 'Destroy denied', text: '🚫 Destroy denied for ' + ctx._resource_id + '.' } }];"
+      },
+      "id": "format-deny",
+      "name": "Format Deny Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $input.first().json;\nreturn [{ json: { _chat_id: ctx._chat_id, _message_id: ctx._message_id, _cb_id: ctx._cb_id, _toast: 'Unauthorized', text: '🚫 Unauthorized callback ignored.' } }];"
+      },
+      "id": "format-unauthorized",
+      "name": "Format Unauthorized",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $input.first().json;\nreturn [{ json: { _chat_id: ctx._chat_id, _message_id: ctx._message_id, _cb_id: ctx._cb_id, _toast: 'Unknown action', text: '⚠ Unknown callback_data: ' + (ctx._raw ?? '(empty)') } }];"
+      },
+      "id": "format-unknown",
+      "name": "Format Unknown",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 640]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/editMessageReplyMarkup",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ chat_id: $json._chat_id, message_id: $json._message_id, reply_markup: { inline_keyboard: [] } }) }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "edit-strip-buttons",
+      "name": "Strip Inline Keyboard",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/answerCallbackQuery",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ callback_query_id: $json._cb_id, text: $json._toast }) }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "answer-callback-query",
+      "name": "Answer Callback Query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json._chat_id }}" },
+            { "name": "text", "value": "={{ $json.text }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "reply-status",
+      "name": "Reply Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 300]
+    }
+  ],
+  "connections": {
+    "Telegram Callback Query Trigger": {
+      "main": [[{ "node": "Authorize & Parse", "type": "main", "index": 0 }]]
+    },
+    "Authorize & Parse": {
+      "main": [[{ "node": "Switch on Action", "type": "main", "index": 0 }]]
+    },
+    "Switch on Action": {
+      "main": [
+        [{ "node": "Railway serviceDelete", "type": "main", "index": 0 }],
+        [{ "node": "Format Deny Result", "type": "main", "index": 0 }],
+        [{ "node": "Format Unauthorized", "type": "main", "index": 0 }],
+        [{ "node": "Format Unknown", "type": "main", "index": 0 }]
+      ]
+    },
+    "Railway serviceDelete": {
+      "main": [[{ "node": "Format Approve Result", "type": "main", "index": 0 }]]
+    },
+    "Format Approve Result": {
+      "main": [[{ "node": "Strip Inline Keyboard", "type": "main", "index": 0 }]]
+    },
+    "Format Deny Result": {
+      "main": [[{ "node": "Strip Inline Keyboard", "type": "main", "index": 0 }]]
+    },
+    "Format Unauthorized": {
+      "main": [[{ "node": "Strip Inline Keyboard", "type": "main", "index": 0 }]]
+    },
+    "Format Unknown": {
+      "main": [[{ "node": "Strip Inline Keyboard", "type": "main", "index": 0 }]]
+    },
+    "Strip Inline Keyboard": {
+      "main": [[{ "node": "Answer Callback Query", "type": "main", "index": 0 }]]
+    },
+    "Answer Callback Query": {
+      "main": [[{ "node": "Reply Status", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Passive listener. Pairs with destroy-resource.json (ADR-0005, Option B). Telegram Trigger receives callback_query updates; the Authorize & Parse node enforces the chat.id whitelist (R-09) and parses 'dr:<verb>:<type>:<id>' callback_data; the Switch routes to approve/deny/unauthorized/unknown arms. The approve arm calls Railway GraphQL serviceDelete(id). All four arms converge to Strip Inline Keyboard (editMessageReplyMarkup) → Answer Callback Query → Reply Status, so a second tap on the same message is a no-op even on race. callback_data prefixes consumed: 'dr:a:rs:' (approve) / 'dr:d:rs:' (deny). Required env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RAILWAY_API_TOKEN. Not a SKILL.md skill — passive trigger, never routed by the Skills Router."
+}

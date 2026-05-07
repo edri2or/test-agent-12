@@ -1,0 +1,37 @@
+# railway.n8n.toml — n8n Orchestrator service
+#
+# Link this file to the `n8n` service in the Railway dashboard:
+#   Railway dashboard → Project → n8n service → Settings → Source → "railway.n8n.toml"
+#
+# n8n uses its official Docker Hub image — no custom Dockerfile needed.
+# All secrets are injected at runtime from GCP Secret Manager via bootstrap.yml.
+
+[build]
+builder = "IMAGE"
+image = "n8nio/n8n:latest"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 60
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Required environment variables (set via apply-railway-provision.yml + bootstrap.yml):
+#   N8N_INSTANCE_OWNER_MANAGED_BY_ENV  = true          (n8n ≥2.17.0, see R-06)
+#   N8N_INSTANCE_OWNER_EMAIL           = <from Secret Manager>
+#   N8N_INSTANCE_OWNER_PASSWORD_HASH   = <bcrypt hash from Secret Manager>
+#   N8N_INSTANCE_OWNER_FIRST_NAME      = Instance
+#   N8N_INSTANCE_OWNER_LAST_NAME       = Owner
+#   N8N_ENCRYPTION_KEY                 = <from Secret Manager>
+#   N8N_RUNNERS_ENABLED                = false          (R-03: port collision mitigation)
+#   N8N_PORT                           = 5678
+#   WEBHOOK_URL                        = https://<Railway public URL>/ (base URL only)
+#   N8N_EDITOR_BASE_URL                = https://<Railway public URL>/ (same as WEBHOOK_URL)
+#   DB_TYPE                            = postgresdb     (injected by bootstrap.yml, ADR-0015)
+#   DATABASE_URL                       = ${{Postgres.DATABASE_URL}}
+#                                        Railway reference variable resolved at deploy time.
+#                                        Do NOT replace with a literal connection string.
+#
+# DO NOT set N8N_PROTOCOL=https — Railway terminates TLS at the load balancer.
+# n8n must bind plain HTTP internally; setting https crashes n8n on startup
+# because it tries to open an HTTPS server without SSL certs (no N8N_SSL_CERT/KEY).

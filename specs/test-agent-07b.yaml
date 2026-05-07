@@ -1,0 +1,31 @@
+apiVersion: aatb.or-infra.com/v1
+kind: SystemSpec
+metadata:
+  name: test-agent-07b
+  description: "Test agent 07b — first-attempt proof after all 7 friction-point fixes"
+spec:
+  gcp:
+    projectId: or-test-agent-07b
+    region: us-central1
+  github:
+    repo: edri2or/test-agent-07b
+    fromTemplate: edri2or/autonomous-agent-template-builder
+  railway:
+    services:
+      - name: agent
+        kind: typescript
+        rootDir: src/agent
+      - name: n8n
+        kind: docker
+        image: n8nio/n8n
+  cloudflare:
+    zone: test-agent-07b.or-infra.com
+    worker:
+      name: test-agent-07b-edge
+      route: test-agent-07b.or-infra.com/*
+  secrets:
+    required:
+      - openrouter-runtime-key
+      - telegram-bot-token
+  intent:
+    source: "prove first-attempt provision success after all 7 autonomy friction fixes (PRs #113-#120)"

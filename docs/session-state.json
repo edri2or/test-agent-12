@@ -1,0 +1,25 @@
+{
+  "_schema": "session-state.v1",
+  "_note": "Machine-readable session state. Written by pre-compact.sh and enforce-current-focus-fresh.sh. Read by post-compact.sh and session-start.sh. Do not edit manually.",
+  "last_updated": "2026-05-07T09:04:33Z",
+  "branch": "claude/create-test-system-eSJmE",
+  "last_commit_hash": "9fb5df6",
+  "last_commit_msg": "chore: update session-state.json",
+  "current_focus_issue_number": null,
+  "current_focus_issue_title": "",
+  "recent_workflow_runs": [
+    "register-provisioner-app.yml run 25450830645: success — provisioner-v4 registered with org_admin, R-07 vendor floor completed",
+    "delete-phantom-org-ruleset dry_run=true run 25450997541: success — 0 rulesets found",
+    "delete-phantom-org-ruleset dry_run=false run 25451121228: success — nothing deleted (0 rulesets)"
+  ],
+  "open_prs_this_session": [
+    "237"
+  ],
+  "journey_last_entry_date": "2026-05-07",
+  "bootstrap_state_last_verified": "2026-05-03",
+  "pending_operator_decisions": [
+    "my-agent-test-5-5 gap investigation: n8n crashes due to DB_TYPE=postgresdb set by bootstrap but no Postgres service in spec; agent offline.",
+    "phantom-runs: GitHub backend stale Required Workflow — invisible to all APIs, operationally harmless. Fix requires GitHub Support if desired."
+  ],
+  "current_focus_issue": null
+}

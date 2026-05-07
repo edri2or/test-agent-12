@@ -1,0 +1,99 @@
+name: Open issue on workflow failure
+
+# Triggered by notify-on-workflow-failure.yml via repository_dispatch.
+# Opens a GitHub Issue labelled `workflow-failure` so the agent picks it
+# up on session-start and investigates autonomously.
+# Deduplicates: if an open issue for the same workflow already exists,
+# adds a comment instead of opening a second issue.
+
+on:
+  repository_dispatch:
+    types: [workflow-run-failed]
+
+permissions:
+  issues: write
+
+jobs:
+  open-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { workflow_name, run_url, head_sha, conclusion } =
+              context.payload.client_payload;
+            const short_sha = (head_sha || 'unknown').slice(0, 7);
+            const label     = 'workflow-failure';
+
+            // Ensure label exists.
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                name:  label,
+              });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner:       context.repo.owner,
+                  repo:        context.repo.repo,
+                  name:        label,
+                  color:       'd73a4a',
+                  description: 'Auto-opened when a monitored workflow fails on main',
+                });
+              } else throw e;
+            }
+
+            // Deduplicate: comment on existing open issue for same workflow.
+            const existing = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                labels: label,
+                state:  'open',
+              }
+            );
+            const title = `[Workflow Failure] ${workflow_name}`;
+            const dup   = existing.find(i => i.title === title);
+
+            const body_detail = [
+              `| Workflow   | \`${workflow_name}\` |`,
+              `| Run        | ${run_url} |`,
+              `| Commit     | \`${short_sha}\` |`,
+              `| Conclusion | \`${conclusion}\` |`,
+            ].join('\n');
+
+            if (dup) {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: dup.number,
+                body: [
+                  `## Recurrence — ${new Date().toISOString().slice(0, 16)}Z`,
+                  '',
+                  '| Field | Value |',
+                  '|-------|-------|',
+                  body_detail,
+                ].join('\n'),
+              });
+              core.notice(`Commented on existing issue #${dup.number}`);
+            } else {
+              const issue = await github.rest.issues.create({
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                title,
+                labels: [label],
+                body: [
+                  `## Workflow failure on \`main\``,
+                  '',
+                  '| Field | Value |',
+                  '|-------|-------|',
+                  body_detail,
+                  '',
+                  '**Agent action required:** investigate the failed run, fix the root cause, and close this issue.',
+                ].join('\n'),
+              });
+              core.notice(`Opened issue #${issue.data.number}`);
+            }

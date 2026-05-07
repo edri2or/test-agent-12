@@ -1,0 +1,70 @@
+name: Unlink billing-account projects
+
+# Unlinks specified projects from GCP_BILLING_ACCOUNT to free billing
+# quota slots. Does NOT delete projects (the runtime SA only has
+# roles/billing.user on the billing account, which permits unlink but
+# not project deletion outside the templet-admin folder).
+#
+# Operator-driven: the input list is the only thing this workflow acts
+# on. Defensive guard: refuses any project ID that doesn't match the
+# kebab-case pattern used by the operator's existing project naming.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_ids:
+        description: 'Comma-separated project IDs to unlink billing from'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  unlink:
+    name: Unlink billing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Validate input pattern
+        run: |
+          IFS=',' read -ra PIDS <<< "${{ inputs.project_ids }}"
+          for pid in "${PIDS[@]}"; do
+            pid_trim=$(echo "$pid" | tr -d ' ')
+            if ! [[ "$pid_trim" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+              echo "::error::REFUSED: project_id '${pid_trim}' does not match GCP project ID pattern"
+              exit 1
+            fi
+          done
+
+      - name: Unlink billing (idempotent)
+        run: |
+          IFS=',' read -ra PIDS <<< "${{ inputs.project_ids }}"
+          {
+            echo "## Unlink results"
+            echo ""
+            echo "| Project ID | Result |"
+            echo "|------------|--------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          FAIL=0
+          for pid in "${PIDS[@]}"; do
+            pid_trim=$(echo "$pid" | tr -d ' ')
+            if OUT=$(gcloud billing projects unlink "$pid_trim" --quiet 2>&1); then
+              echo "| \`$pid_trim\` | ✅ unlinked |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice title=unlinked::$pid_trim"
+            else
+              ENC=$(printf '%s' "$OUT" | tr '\n' '|' | head -c 500)
+              echo "| \`$pid_trim\` | ❌ $ENC |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error title=unlink-FAIL::$pid_trim — $ENC"
+              FAIL=1
+            fi
+          done
+          [ $FAIL -eq 0 ] || exit 1

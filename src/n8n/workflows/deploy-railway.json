@@ -1,0 +1,206 @@
+{
+  "name": "Deploy Railway (real handler — serviceInstanceRedeploy via GraphQL)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "deploy-railway",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Deploy Railway Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "deploy-railway"
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 validation of the inbound webhook (R-02: fail-closed).\nconst crypto = require('crypto');\nconst secret = $env['DEPLOY_RAILWAY_WEBHOOK_SECRET'] ?? '';\nif (!secret) throw new Error('DEPLOY_RAILWAY_WEBHOOK_SECRET missing — fail-closed (R-02)');\nconst sig = $input.first().headers['x-signature-256'] ?? '';\nconst rawBody = $input.first().binary?.data?.data\n  ? Buffer.from($input.first().binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify($input.first().json);\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nif (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n  throw new Error('Invalid HMAC — dropping payload (R-02)');\n}\n\nconst body = $input.first().json ?? {};\nconst service_id = body.service_id;\nif (!service_id || typeof service_id !== 'string') throw new Error('Missing or non-string service_id');\nconst environment_id = typeof body.environment_id === 'string' && body.environment_id.length > 0 ? body.environment_id : '';\nconst chat_id = body.chat_id ? String(body.chat_id) : '';\n\nreturn [{\n  json: {\n    intent: 'deploy release ship railway redeploy ' + service_id,\n    chat_id,\n    user_id: String(body.user_id ?? ''),\n    timestamp: new Date().toISOString(),\n    metadata: { service_id, environment_id }\n  }\n}];"
+      },
+      "id": "validate-and-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 over the exact body string the Router will read (ADR-0003).\nconst crypto = require('crypto');\nconst p = $input.first().json;\nconst bodyObj = {\n  intent: p.intent,\n  chat_id: p.chat_id,\n  user_id: p.user_id,\n  timestamp: p.timestamp,\n  metadata: p.metadata,\n};\nconst bodyStr = JSON.stringify(bodyObj);\nconst secret = $env['SKILLS_ROUTER_SECRET'] ?? '';\nif (!secret) throw new Error('SKILLS_ROUTER_SECRET missing — fail-closed (R-02)');\nconst sig = 'sha256=' + crypto.createHmac('sha256', secret).update(bodyStr).digest('hex');\nreturn [{ json: { _bodyStr: bodyStr, _sig: sig, _chat_id: p.chat_id, _meta: p.metadata } }];"
+      },
+      "id": "compute-hmac",
+      "name": "Compute Skills Router HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env['SKILLS_ROUTER_URL'] }}/webhook",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-signature-256", "value": "={{ $json._sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json._bodyStr }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "call-skills-router",
+      "name": "Call Skills Router",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "right-skill",
+              "leftValue": "={{ $json.skill ?? '' }}",
+              "rightValue": "deploy-railway",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "not-pending",
+              "leftValue": "={{ $json.status ?? '' }}",
+              "rightValue": "pending_approval",
+              "operator": { "type": "string", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "routing-gate",
+      "name": "Routing Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://backboard.railway.app/graphql/v2",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env['RAILWAY_API_TOKEN'] }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ query: 'mutation Redeploy($serviceId: String!, $environmentId: String!) { serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }', variables: { serviceId: $('Compute Skills Router HMAC').first().json._meta.service_id, environmentId: ($('Compute Skills Router HMAC').first().json._meta.environment_id || $env['RAILWAY_ENVIRONMENT_ID'] || '') } }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "trigger-redeploy",
+      "name": "Trigger Railway Redeploy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst meta = $('Compute Skills Router HMAC').first().json._meta;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nif (r?.errors && Array.isArray(r.errors) && r.errors.length > 0) {\n  const msg = r.errors.map((e) => e?.message ?? 'unknown').join('; ');\n  return [{ json: { chat_id, text: 'Railway redeploy failed for service ' + meta.service_id + ': ' + msg } }];\n}\nif (r?.data?.serviceInstanceRedeploy === true) {\n  return [{ json: { chat_id, text: 'Railway redeploy triggered for service ' + meta.service_id } }];\n}\nreturn [{ json: { chat_id, text: 'Railway redeploy returned unexpected response for service ' + meta.service_id + ': ' + JSON.stringify(r).slice(0, 500) } }];"
+      },
+      "id": "format-success",
+      "name": "Format Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst chat_id = $('Compute Skills Router HMAC').first().json._chat_id;\nlet reason;\nif (r?.status === 'pending_approval') {\n  reason = 'pending_approval (' + (r.reason ?? 'requires_approval') + ')';\n} else if (r?.matched === false) {\n  reason = 'no skill matched';\n} else if (r?.skill && r.skill !== 'deploy-railway') {\n  reason = 'router routed to a different skill: ' + r.skill;\n} else {\n  reason = 'unexpected router response';\n}\nreturn [{ json: { chat_id, text: 'Railway redeploy not triggered — ' + reason } }];"
+      },
+      "id": "format-deny",
+      "name": "Format Deny",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env['TELEGRAM_BOT_TOKEN'] }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "chat_id", "value": "={{ $json.chat_id }}" },
+            { "name": "text", "value": "={{ $json.text }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "reply-telegram",
+      "name": "Reply to Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 300]
+    }
+  ],
+  "connections": {
+    "Deploy Railway Webhook": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[
+        { "node": "Respond 200 OK", "type": "main", "index": 0 },
+        { "node": "Compute Skills Router HMAC", "type": "main", "index": 0 }
+      ]]
+    },
+    "Compute Skills Router HMAC": {
+      "main": [[{ "node": "Call Skills Router", "type": "main", "index": 0 }]]
+    },
+    "Call Skills Router": {
+      "main": [[{ "node": "Routing Gate", "type": "main", "index": 0 }]]
+    },
+    "Routing Gate": {
+      "main": [
+        [{ "node": "Trigger Railway Redeploy", "type": "main", "index": 0 }],
+        [{ "node": "Format Deny", "type": "main", "index": 0 }]
+      ]
+    },
+    "Trigger Railway Redeploy": {
+      "main": [[{ "node": "Format Success", "type": "main", "index": 0 }]]
+    },
+    "Format Success": {
+      "main": [[{ "node": "Reply to Telegram", "type": "main", "index": 0 }]]
+    },
+    "Format Deny": {
+      "main": [[{ "node": "Reply to Telegram", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "_comment": "Real handler. Pattern mirrors github-pr.json (PR #12) and create-adr.json (PR #11): webhook → HMAC validate (R-02 fail-closed) → Respond 200 in parallel → ADR-0003 sign → Call Skills Router → Routing Gate IF (skill==='deploy-railway' && status!=='pending_approval') → Railway GraphQL POST (serviceInstanceRedeploy(serviceId, environmentId)) → Telegram reply. Required env vars: DEPLOY_RAILWAY_WEBHOOK_SECRET, SKILLS_ROUTER_URL, SKILLS_ROUTER_SECRET, RAILWAY_API_TOKEN (Railway account-scope token, same one used by bootstrap.yml's variableCollectionUpsert), RAILWAY_ENVIRONMENT_ID (default fallback when payload omits environment_id), TELEGRAM_BOT_TOKEN. Inbound payload contract: { service_id: string (required, Railway service ID), environment_id?: string (defaults to RAILWAY_ENVIRONMENT_ID env var), chat_id?: number|string, user_id?: number|string }. The mutation is non-destructive: serviceInstanceRedeploy re-runs the latest deployment without altering source or config. SKILL.md classifies this as requires_approval=false."
+}
