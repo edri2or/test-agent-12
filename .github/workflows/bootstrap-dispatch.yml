@@ -606,7 +606,7 @@ jobs:
               # provisioned Postgres and written railway-postgres-service-id to SM.
               # n8n does NOT support DATABASE_URL or DB_POSTGRESDB_URL — only the
               # individual DB_POSTGRESDB_{HOST,PORT,DATABASE,USER,PASSWORD,SSL_*} vars
-              # (see n8n config schema). Railway reference variables of the form ${{Service.VAR}}
+              # (see n8n config schema). Railway service reference variables
               # resolve to the Postgres service's actual values at runtime.
               **( {"DB_TYPE":                              "postgresdb",
                    "DB_POSTGRESDB_HOST":                   "${{ '${{' }}Postgres.RAILWAY_PRIVATE_DOMAIN}}",
